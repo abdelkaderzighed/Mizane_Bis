@@ -1,0 +1,1217 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import AnalysisSection from './components/AnalysisSection';
+import AssistantPanel from './components/AssistantPanel';
+import CollapsibleSection from './components/CollapsibleSection';
+import { FileText, Download, Play, StopCircle, RefreshCw, CheckCircle, XCircle, Loader, Calendar, Trash2, ExternalLink, Info } from 'lucide-react';
+import { API_URL } from './config';
+
+export default function DocumentHarvesterApp() {
+  const [harvesters, setHarvesters] = useState([]);
+  const [selectedHarvester, setSelectedHarvester] = useState('generic');
+  const [currentJob, setCurrentJob] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [taskOptions, setTaskOptions] = useState({ collect: true, download: true, analyze: false });
+  const [sites, setSites] = useState([]);
+  const [sitesLoading, setSitesLoading] = useState(false);
+  const [selectedSiteId, setSelectedSiteId] = useState(null);
+  const [selectedSiteIds, setSelectedSiteIds] = useState([]);
+  const [documentsData, setDocumentsData] = useState({ items: [], total: 0, page: 1, pageSize: 25, collections: [] });
+  const [documentsLoading, setDocumentsLoading] = useState(false);
+  const [documentFilters, setDocumentFilters] = useState({
+    search: '',
+    collection: '',
+    status: '',
+    phase: '',
+    startDate: '1962-01-01',
+    endDate: new Date().toISOString().split('T')[0],
+  });
+  const [selectedDocumentIds, setSelectedDocumentIds] = useState([]);
+  
+  const [formData, setFormData] = useState({
+    url: '',
+    site_name: '',
+    max_results: '',
+    collection_name: '',
+    extensions: ['.pdf'],
+    workers: 2,
+    timeout: 60,
+    delay_between: 0.5,
+    retry_delay: 2,
+    // Filtres
+    date_start: '1962-01-01',
+    date_end: new Date().toISOString().split('T')[0],
+    file_types: ['pdf'],
+    keywords: '',
+    languages: []
+  });
+  const [showAdvancedParams, setShowAdvancedParams] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
+
+  useEffect(() => {
+    fetch(`${API_URL}/harvesters`)
+      .then(res => res.json())
+      .then(data => setHarvesters(data.harvesters))
+      .catch(err => console.error('Erreur:', err));
+  }, []);
+
+  // Pré-remplir les champs selon le type de moissonneur sélectionné
+  useEffect(() => {
+    if (selectedHarvester === 'joradp') {
+      const currentYear = new Date().getFullYear().toString();
+      const defaultEndDate = new Date().toISOString().split('T')[0];
+      setFormData(prev => ({
+        ...prev,
+        url: 'https://www.joradp.dz',
+        site_name: 'JORADP',
+        collection_name: currentYear,
+        date_start: prev.date_start || '1962-01-01',
+        date_end: prev.date_end || defaultEndDate,
+        max_results: ''
+      }));
+    } else if (selectedHarvester === 'generic') {
+      const defaultEndDate = new Date().toISOString().split('T')[0];
+      setFormData(prev => ({
+        ...prev,
+        url: '',
+        site_name: '',
+        collection_name: '',
+        date_start: prev.date_start || '1962-01-01',
+        date_end: prev.date_end || defaultEndDate,
+        max_results: ''
+      }));
+    }
+  }, [selectedHarvester]);
+
+  useEffect(() => {
+    loadSitesSummary();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedSiteId && sites.length > 0) {
+      setSelectedSiteId(sites[0].id);
+    }
+  }, [sites, selectedSiteId]);
+
+  useEffect(() => {
+    if (selectedSiteId) {
+      loadSiteDocuments({ page: 1 });
+    }
+  }, [selectedSiteId, documentFilters.search, documentFilters.collection, documentFilters.status, documentFilters.phase, documentFilters.startDate, documentFilters.endDate]);
+
+  const handleInputChange = (e) => {
+    const { name, value } = e.target;
+    setFormData(prev => ({
+      ...prev,
+      [name]: ['max_results', 'workers', 'timeout'].includes(name)
+        ? (value === '' ? '' : parseInt(value, 10))
+        : ['delay_between', 'retry_delay'].includes(name)
+        ? parseFloat(value)
+        : value
+    }));
+  };
+
+  const startHarvest = async () => {
+    setIsLoading(true);
+    
+    try {
+      const payload = {
+        harvester_type: selectedHarvester,
+        ...formData
+      };
+
+      const tasks = ['collect'];
+      if (taskOptions.download || taskOptions.analyze) {
+        if (!tasks.includes('download')) tasks.push('download');
+      }
+      if (taskOptions.analyze) {
+        if (!tasks.includes('download')) tasks.push('download');
+        if (!tasks.includes('analyze')) tasks.push('analyze');
+      }
+      payload.tasks = tasks;
+
+      const response = await fetch(`${API_URL}/harvest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await response.json();
+      
+      if (data.job_id) {
+        const initialPhases = {
+          collect: { status: 'running', processed: 0, total: 0 },
+          download: { status: tasks.includes('download') ? 'pending' : 'skipped', processed: 0, total: 0 },
+          analyze: { status: tasks.includes('analyze') ? 'pending' : 'skipped', processed: 0, total: 0 },
+        };
+        setCurrentJob({
+          id: data.job_id,
+          status: 'running',
+          phases: initialPhases,
+          tasks,
+          site_id: selectedSiteId,
+        });
+        pollJobStatus(data.job_id);
+      }
+    } catch (error) {
+      console.error('Erreur:', error);
+      alert('Erreur lors du lancement du moissonnage');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Fonction pour arrêter un moissonnage
+  const stopHarvest = async (jobId) => {
+    try {
+      const response = await fetch(`${API_URL}/harvest/${jobId}/stop`, {
+        method: 'POST'
+      });
+      
+      if (response.ok) {
+        alert('Demande d\'arrêt envoyée');
+        // Recharger le statut
+        setTimeout(() => {
+          if (currentJob && currentJob.id === jobId) {
+            pollJobStatus(jobId);
+          }
+        }, 1000);
+      }
+    } catch (error) {
+      console.error('Erreur lors de l\'arrêt:', error);
+      alert('Erreur lors de l\'arrêt du moissonnage');
+    }
+  };
+
+
+  const pollJobStatus = async (jobId) => {
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_URL}/harvest/${jobId}`);
+        const job = await response.json();
+        setCurrentJob(prev => ({
+          ...prev,
+          ...job,
+          phases: job.phases || prev?.phases || {},
+        }));
+
+        if (job.status === 'completed' || job.status === 'error') {
+          clearInterval(interval);
+          loadSitesSummary();
+          loadSiteDocuments({ page: 1 });
+        }
+      } catch (error) {
+        clearInterval(interval);
+        console.error('Erreur:', error);
+      }
+    }, 2000);
+  };
+
+  const loadSitesSummary = async () => {
+    try {
+      setSitesLoading(true);
+      const response = await fetch(`${API_URL}/sites`);
+      const data = await response.json();
+      setSites(data.sites || []);
+    } catch (error) {
+      console.error('Erreur chargement sites:', error);
+    } finally {
+      setSitesLoading(false);
+    }
+  };
+
+  const buildDocumentQuery = (overrides = {}) => {
+    const page = overrides.page || documentsData.page || 1;
+    const pageSize = overrides.pageSize || documentsData.pageSize || 25;
+    const params = new URLSearchParams();
+    params.set('page', page);
+    params.set('page_size', pageSize);
+    if (documentFilters.search) params.set('search', documentFilters.search);
+    if (documentFilters.collection) params.set('collection', documentFilters.collection);
+    if (documentFilters.status) params.set('status', documentFilters.status);
+    if (documentFilters.phase) params.set('phase', documentFilters.phase);
+    if (documentFilters.startDate) params.set('start_date', documentFilters.startDate);
+    if (documentFilters.endDate) params.set('end_date', documentFilters.endDate);
+    return { params, page, pageSize };
+  };
+
+  const loadSiteDocuments = async (overrides = {}) => {
+    if (!selectedSiteId) {
+      setDocumentsData((prev) => ({ ...prev, items: [], total: 0 }));
+      return;
+    }
+    const { params, page, pageSize } = buildDocumentQuery(overrides);
+    try {
+      setDocumentsLoading(true);
+      const response = await fetch(`${API_URL}/sites/${selectedSiteId}/documents?${params.toString()}`);
+      const data = await response.json();
+      setDocumentsData({
+        items: data.items || [],
+        total: data.total || 0,
+        page,
+        pageSize,
+        collections: data.collections || [],
+      });
+      setSelectedDocumentIds([]);
+    } catch (error) {
+      console.error('Erreur chargement documents:', error);
+    } finally {
+      setDocumentsLoading(false);
+    }
+  };
+
+  const handleTaskToggle = (task) => {
+    setTaskOptions((prev) => {
+      const next = { ...prev };
+      if (task === 'download') {
+        const nextValue = !prev.download;
+        next.download = nextValue;
+        if (!nextValue) {
+          next.analyze = false;
+        }
+      } else if (task === 'analyze') {
+        next.analyze = !prev.analyze;
+        if (next.analyze) {
+          next.download = true;
+        }
+      }
+      next.collect = true;
+      return next;
+    });
+  };
+
+  const handleSiteRowClick = (site) => {
+    setSelectedSiteId(site.id);
+    if (site?.base_url) {
+      let derivedName = site.base_url;
+      try {
+        derivedName = new URL(site.base_url).hostname.replace('www.', '');
+      } catch (e) {
+        // ignore parsing errors
+      }
+      setFormData((prev) => ({
+        ...prev,
+        url: prev.url || site.base_url,
+        site_name: prev.site_name || derivedName,
+      }));
+    }
+  };
+
+  const toggleSiteSelection = (siteId) => {
+    setSelectedSiteIds((prev) =>
+      prev.includes(siteId) ? prev.filter((id) => id !== siteId) : [...prev, siteId]
+    );
+  };
+
+  const deleteSelectedSites = async () => {
+    if (selectedSiteIds.length === 0) return;
+    if (!window.confirm(`Supprimer ${selectedSiteIds.length} site(s) et toutes leurs données ?`)) return;
+    try {
+      for (const id of selectedSiteIds) {
+        await fetch(`${API_URL}/sites/${id}`, { method: 'DELETE' });
+      }
+      setSelectedSiteIds([]);
+      if (selectedSiteIds.includes(selectedSiteId)) {
+        setSelectedSiteId(null);
+      }
+      await loadSitesSummary();
+      setDocumentsData({ items: [], total: 0, page: 1, pageSize: documentsData.pageSize, collections: [] });
+    } catch (error) {
+      console.error('Erreur suppression site:', error);
+    }
+  };
+
+  const toggleDocumentSelection = (docId) => {
+    setSelectedDocumentIds((prev) =>
+      prev.includes(docId) ? prev.filter((id) => id !== docId) : [...prev, docId]
+    );
+  };
+
+  const toggleAllDocuments = (checked) => {
+    if (checked) {
+      setSelectedDocumentIds(documentsData.items.map((doc) => doc.id));
+    } else {
+      setSelectedDocumentIds([]);
+    }
+  };
+
+  const deleteSelectedDocuments = async () => {
+    if (!selectedSiteId || selectedDocumentIds.length === 0) return;
+    if (!window.confirm(`Supprimer ${selectedDocumentIds.length} document(s) sélectionné(s) ?`)) return;
+    try {
+      await fetch(`${API_URL}/sites/${selectedSiteId}/documents/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document_ids: selectedDocumentIds }),
+      });
+      setSelectedDocumentIds([]);
+      loadSiteDocuments({ page: documentsData.page });
+      loadSitesSummary();
+    } catch (error) {
+      console.error('Erreur suppression documents:', error);
+    }
+  };
+
+  const handleDocumentFilterChange = (field, value) => {
+    setDocumentFilters((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleDocumentPageChange = (page) => {
+    loadSiteDocuments({ page });
+  };
+
+  const handleDocumentPageSizeChange = (pageSize) => {
+    loadSiteDocuments({ page: 1, pageSize });
+  };
+
+  const openDocumentOnline = (doc) => {
+    if (doc.url) {
+      window.open(doc.url, '_blank', 'noopener');
+    }
+  };
+
+  const openDocumentLocal = (doc) => {
+    if (doc.local_path) {
+      window.open(`file://${doc.local_path}`);
+    }
+  };
+
+  const resetDocumentFilters = () => {
+    setDocumentFilters({
+      search: '',
+      collection: '',
+      status: '',
+      startDate: '1962-01-01',
+      endDate: new Date().toISOString().split('T')[0],
+    });
+  };
+
+  const numberFormatter = new Intl.NumberFormat('fr-FR');
+
+  const aggregatedStats = React.useMemo(() => {
+    return sites.reduce(
+      (acc, site) => {
+        const stats = site.stats || {};
+        acc.total += stats.total || 0;
+        acc.downloaded += stats.downloaded || 0;
+        acc.analyzed += stats.analyzed || 0;
+        acc.errors += (stats.analyze_errors || 0) + ((stats.total || 0) - (stats.downloaded || 0));
+        return acc;
+      },
+      { total: 0, downloaded: 0, analyzed: 0, errors: 0 }
+    );
+  }, [sites]);
+
+  const formatFileSize = (size) => {
+    if (!size) return '—';
+    const units = ['octets', 'Ko', 'Mo', 'Go', 'To'];
+    let value = size;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
+  };
+
+  const phaseOrder = ['collect', 'download', 'analyze'];
+  const phaseLabels = {
+    collect: 'Collecte des métadonnées',
+    download: 'Téléchargement des fichiers',
+    analyze: 'Analyse IA',
+  };
+
+  const formatPhaseStatus = (status) => {
+    switch (status) {
+      case 'running':
+        return 'En cours';
+      case 'completed':
+      case 'success':
+        return 'Terminé';
+      case 'partial':
+        return 'Partiel';
+      case 'error':
+        return 'Erreur';
+      case 'queued':
+        return 'En file';
+      case 'pending':
+        return 'En attente';
+      case 'skipped':
+        return 'Ignoré';
+      default:
+        return status || '—';
+    }
+  };
+
+  const getPhaseStatusClasses = (status) => {
+    switch (status) {
+      case 'completed':
+      case 'success':
+        return 'bg-green-100 text-green-700';
+      case 'running':
+      case 'partial':
+        return 'bg-blue-100 text-blue-700';
+      case 'queued':
+      case 'pending':
+        return 'bg-amber-100 text-amber-700';
+      case 'error':
+        return 'bg-red-100 text-red-700';
+      case 'skipped':
+        return 'bg-gray-200 text-gray-500';
+      default:
+        return 'bg-gray-200 text-gray-500';
+    }
+  };
+
+  const docPhaseDotClass = (status) => {
+    switch (status) {
+      case 'completed':
+      case 'success':
+        return 'bg-green-500';
+      case 'running':
+      case 'partial':
+        return 'bg-blue-500';
+      case 'queued':
+      case 'pending':
+        return 'bg-amber-500';
+      case 'error':
+        return 'bg-red-500';
+      case 'skipped':
+        return 'bg-gray-400';
+      default:
+        return 'bg-gray-300';
+    }
+  };
+
+  const formatDateTime = (value) => (value ? new Date(value).toLocaleString('fr-FR') : '—');
+
+  const formatSiteName = (site) => {
+    if (!site?.base_url) return 'Site';
+    try {
+      return new URL(site.base_url).hostname.replace('www.', '');
+    } catch (error) {
+      return site.base_url;
+    }
+  };
+
+  const currentSite = sites.find((site) => site.id === selectedSiteId) || null;
+  const totalPages = documentsData.pageSize
+    ? Math.max(1, Math.ceil(documentsData.total / documentsData.pageSize))
+    : 1;
+  const documents = documentsData.items || [];
+  const startItem = documentsData.total > 0 ? (documentsData.page - 1) * documentsData.pageSize + 1 : 0;
+  const endItem = documentsData.total > 0 ? startItem + documents.length - 1 : 0;
+  const isJobRunning = currentJob?.status === 'running';
+  const currentJobPhases = currentJob?.phases || {};
+  const currentTasks = currentJob?.tasks || [];
+
+  const renderPhaseProgress = (phaseKey, phaseData = {}) => {
+    const status = phaseData.status || 'pending';
+    const processed = phaseData.processed ?? 0;
+    const total = phaseData.total ?? 0;
+    const showProgress = total > 0;
+    const percentage = showProgress
+      ? Math.round((processed / total) * 100)
+      : status === 'completed' || status === 'success'
+      ? 100
+      : 0;
+
+    return (
+      <div key={phaseKey} className="space-y-1">
+        <div className="flex items-center justify-between text-sm font-medium text-gray-700">
+          <span>{phaseLabels[phaseKey] || phaseKey}</span>
+          <span className={`text-xs px-2 py-0.5 rounded-full ${getPhaseStatusClasses(status)}`}>
+            {formatPhaseStatus(status)}
+          </span>
+        </div>
+        {showProgress && (
+          <div className="h-2 bg-gray-200 rounded">
+            <div
+              className={`h-2 rounded ${status === 'error' ? 'bg-red-500' : 'bg-indigo-500'}`}
+              style={{ width: `${Math.min(percentage, 100)}%` }}
+            />
+          </div>
+        )}
+        {showProgress && (
+          <div className="text-xs text-gray-500">
+            {processed} / {total}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const resetDocumentFilters = () => {
+    setDocumentFilters({
+      search: '',
+      collection: '',
+      status: '',
+      phase: '',
+      startDate: '1962-01-01',
+      endDate: new Date().toISOString().split('T')[0],
+    });
+  };
+
+  const numberFormatter = new Intl.NumberFormat('fr-FR');
+  const phaseOrder = ['collect', 'download', 'analyze'];
+  const phaseLabels = {
+    collect: 'Collecte des métadonnées',
+    download: 'Téléchargement des fichiers',
+    analyze: 'Analyse IA',
+  };
+  const formatPhaseStatus = (status) => {
+    switch (status) {
+      case 'running':
+        return 'En cours';
+      case 'completed':
+      case 'success':
+        return 'Terminé';
+      case 'partial':
+        return 'Partiel';
+      case 'error':
+        return 'Erreur';
+      case 'queued':
+        return 'En file';
+      case 'pending':
+        return 'En attente';
+      case 'skipped':
+        return 'Ignoré';
+      default:
+        return status || '—';
+    }
+  };
+  const getPhaseStatusClasses = (status) => {
+    switch (status) {
+      case 'completed':
+      case 'success':
+        return 'bg-green-100 text-green-700';
+      case 'running':
+      case 'partial':
+        return 'bg-blue-100 text-blue-700';
+      case 'queued':
+      case 'pending':
+        return 'bg-amber-100 text-amber-700';
+      case 'error':
+        return 'bg-red-100 text-red-700';
+      case 'skipped':
+        return 'bg-gray-200 text-gray-500';
+      default:
+        return 'bg-gray-200 text-gray-500';
+    }
+  };
+  const docPhaseDotClass = (status) => {
+    switch (status) {
+      case 'completed':
+      case 'success':
+        return 'bg-green-500';
+      case 'running':
+      case 'partial':
+        return 'bg-blue-500';
+      case 'queued':
+      case 'pending':
+        return 'bg-amber-500';
+      case 'error':
+        return 'bg-red-500';
+      case 'skipped':
+        return 'bg-gray-400';
+      default:
+        return 'bg-gray-300';
+    }
+  };
+  const formatDateTime = (value) => (value ? new Date(value).toLocaleString('fr-FR') : '—');
+  const formatSiteName = (site) => {
+    if (!site?.base_url) return 'Site';
+    try {
+      return new URL(site.base_url).hostname.replace('www.', '');
+    } catch (error) {
+      return site.base_url;
+    }
+  };
+  const currentSite = sites.find((site) => site.id === selectedSiteId) || null;
+  const totalPages = documentsData.pageSize
+    ? Math.max(1, Math.ceil(documentsData.total / documentsData.pageSize))
+    : 1;
+  const documents = documentsData.items || [];
+  const startItem = documentsData.total > 0 ? (documentsData.page - 1) * documentsData.pageSize + 1 : 0;
+  const endItem = documentsData.total > 0 ? startItem + documents.length - 1 : 0;
+
+  const renderPhaseProgress = (phaseKey, phaseData = {}) => {
+    const status = phaseData.status || 'pending';
+    const processed = phaseData.processed ?? 0;
+    const total = phaseData.total ?? 0;
+    const showProgress = total > 0;
+    const percentage = showProgress ? Math.round((processed / total) * 100) : status === 'completed' || status === 'success' ? 100 : 0;
+
+    return (
+      <div key={phaseKey} className="space-y-1">
+        <div className="flex items-center justify-between text-sm font-medium text-gray-700">
+          <span>{phaseLabels[phaseKey] || phaseKey}</span>
+          <span className={`text-xs px-2 py-0.5 rounded-full ${getPhaseStatusClasses(status)}`}>
+            {formatPhaseStatus(status)}
+          </span>
+        </div>
+        {showProgress && (
+          <div className="h-2 bg-gray-200 rounded">
+            <div
+              className={`h-2 rounded ${status === 'error' ? 'bg-red-500' : 'bg-indigo-500'}`}
+              style={{ width: `${Math.min(percentage, 100)}%` }}
+            />
+          </div>
+        )}
+        {showProgress && (
+          <div className="text-xs text-gray-500">
+            {processed} / {total}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const selectedHarvesterInfo = harvesters.find(h => h.id === selectedHarvester);
+
+
+  const viewDocumentJson = (doc) => {
+    const jsonStr = JSON.stringify(doc, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank');
+  };
+
+  const renderHeader = () => (
+    <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <FileText className="w-8 h-8 text-indigo-600" />
+          <div>
+            <h1 className="text-3xl font-bold text-gray-800">
+              Moissonneur de Documents
+            </h1>
+            <p className="text-gray-600">
+              Configurez vos collectes, suivez leur progression et gérez vos archives en un seul endroit.
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              loadSitesSummary();
+              loadSiteDocuments({ page: 1 });
+            }}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-300 text-sm text-gray-700 hover:bg-gray-100"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Actualiser
+          </button>
+        </div>
+      </div>
+      <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="border border-gray-200 rounded-lg p-4">
+          <p className="text-sm text-gray-500">Sites suivis</p>
+          <p className="mt-2 text-2xl font-semibold text-gray-900">{numberFormatter.format(sites.length)}</p>
+        </div>
+        <div className="border border-gray-200 rounded-lg p-4">
+          <p className="text-sm text-gray-500">Documents répertoriés</p>
+          <p className="mt-2 text-2xl font-semibold text-gray-900">
+            {numberFormatter.format(aggregatedStats.total)}
+          </p>
+          <p className="text-xs text-gray-500">{numberFormatter.format(aggregatedStats.downloaded)} téléchargés</p>
+        </div>
+        <div className="border border-gray-200 rounded-lg p-4">
+          <p className="text-sm text-gray-500">Analyses IA</p>
+          <p className="mt-2 text-2xl font-semibold text-gray-900">
+            {numberFormatter.format(aggregatedStats.analyzed)}
+          </p>
+          <p className="text-xs text-gray-500">{numberFormatter.format(aggregatedStats.errors)} en attente ou en erreur</p>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8">
+      <div className="max-w-6xl mx-auto space-y-8">
+        {renderHeader()}
+
+        {activeTab === 'archive' ? (
+          <ArchiveDashboard />
+        ) : (
+          <>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              <div className="bg-white rounded-lg shadow-lg p-6">
+            <h2 className="text-xl font-semibold mb-6 text-gray-800 border-b pb-3">
+              Configuration du Moissonnage
+            </h2>
+
+            {/* Type de Moissonneur */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Type de Moissonneur <span className="text-red-500">*</span>
+              </label>
+              <select
+                value={selectedHarvester}
+                onChange={(e) => setSelectedHarvester(e.target.value)}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                required
+              >
+                {harvesters.map(h => (
+                  <option key={h.id} value={h.id}>
+                    {h.name}
+                  </option>
+                ))}
+              </select>
+              {selectedHarvesterInfo && (
+                <p className="text-sm text-gray-500 mt-2">
+                  {selectedHarvesterInfo.description}
+                </p>
+              )}
+            </div>
+
+            {/* URL principale */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                URL principale du site <span className="text-red-500">*</span>
+              </label>
+              <input
+                type="url"
+                name="url"
+                value={formData.url}
+                onChange={(e) => {
+                  handleInputChange(e);
+                  // Auto-remplir le nom du site depuis l'URL
+                  if (!formData.site_name && e.target.value) {
+                    try {
+                      const hostname = new URL(e.target.value).hostname;
+                      const siteName = hostname.replace('www.', '').split('.')[0];
+                      setFormData(prev => ({
+                        ...prev,
+                        site_name: siteName.charAt(0).toUpperCase() + siteName.slice(1)
+                      }));
+                    } catch (err) {
+                      // URL invalide, on ignore
+                    }
+                  }
+                }}
+                placeholder="https://example.com"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                required
+              />
+            </div>
+
+            {/* Nom du site */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Nom du site <span className="text-red-500">*</span>
+              </label>
+              <input
+                type="text"
+                name="site_name"
+                value={formData.site_name}
+                onChange={handleInputChange}
+                placeholder="Nom utilisé pour le répertoire de stockage"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                required
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Auto-rempli depuis l'URL, mais modifiable
+              </p>
+            </div>
+
+            {/* Nombre de documents à extraire */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Nombre de documents à extraire
+              </label>
+              <input
+                type="number"
+                name="max_results"
+                value={formData.max_results}
+                onChange={handleInputChange}
+                min="1"
+                placeholder="Laisser vide pour tout extraire"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Si vide : extrait tous les documents accessibles
+              </p>
+            </div>
+
+            {/* Nom de la collection */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Nom de la collection
+              </label>
+              <input
+                type="text"
+                name="collection_name"
+                value={formData.collection_name}
+                onChange={handleInputChange}
+                placeholder="Ex: 2024, publications, documents..."
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Sous-répertoire de stockage. Si vide, documents stockés à la racine du site
+              </p>
+            </div>
+
+            {/* Numéros de début et fin */}
+            <div className="grid grid-cols-2 gap-4 mb-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Numéro de début
+                </label>
+                <input
+                  type="number"
+                  name="start_number"
+                  value={formData.start_number}
+                  onChange={handleInputChange}
+                  min="1"
+                  placeholder="Optionnel"
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Numéro de fin
+                </label>
+                <input
+                  type="number"
+                  name="end_number"
+                  value={formData.end_number}
+                  onChange={handleInputChange}
+                  min="1"
+                  placeholder="Optionnel"
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                />
+              </div>
+            </div>
+
+            <CollapsibleSection title="⚙️ Paramètres techniques" bgColor="bg-gray-50" defaultOpen={false}>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Workers parallèles
+                  </label>
+                  <input
+                    type="number"
+                    name="workers"
+                    value={formData.workers}
+                    onChange={handleInputChange}
+                    min="1"
+                    max="10"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Timeout (secondes)
+                  </label>
+                  <input
+                    type="number"
+                    name="timeout"
+                    value={formData.timeout}
+                    onChange={handleInputChange}
+                    min="10"
+                    max="300"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Délai entre requêtes (s)
+                  </label>
+                  <input
+                    type="number"
+                    name="delay_between"
+                    value={formData.delay_between}
+                    onChange={handleInputChange}
+                    min="0"
+                    max="10"
+                    step="0.1"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Délai avant retry (s)
+                  </label>
+                  <input
+                    type="number"
+                    name="retry_delay"
+                    value={formData.retry_delay}
+                    onChange={handleInputChange}
+                    min="1"
+                    max="30"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 text-sm"
+                  />
+                </div>
+              </div>
+            </CollapsibleSection>
+
+            <CollapsibleSection title="🔍 Filtres de documents" bgColor="bg-blue-50" defaultOpen={false}>
+              <div className="grid grid-cols-2 gap-4 mb-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Date début (optionnel)
+                  </label>
+                  <input
+                    type="date"
+                    name="date_start"
+                    value={formData.date_start}
+                    onChange={handleInputChange}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Date fin (optionnel)
+                  </label>
+                  <input
+                    type="date"
+                    name="date_end"
+                    value={formData.date_end}
+                    onChange={handleInputChange}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 text-sm"
+                  />
+                </div>
+              </div>
+
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Mots-clés dans le titre (optionnel)
+                </label>
+                <input
+                  type="text"
+                  name="keywords"
+                  value={formData.keywords}
+                  onChange={handleInputChange}
+                  placeholder="ex: décret, loi, arrêté..."
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 text-sm"
+                />
+              </div>
+
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Types de fichiers (sélection multiple)
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {['pdf', 'docx', 'xlsx', 'png', 'jpg', 'rtf', 'tex', 'json', 'html', 'txt'].map(type => (
+                    <label key={type} className="flex items-center gap-1 px-2 py-1 bg-white border rounded text-sm cursor-pointer hover:bg-gray-50">
+                      <input
+                        type="checkbox"
+                        checked={formData.file_types.includes(type)}
+                        onChange={(e) => {
+                          const types = e.target.checked 
+                            ? [...formData.file_types, type]
+                            : formData.file_types.filter(t => t !== type);
+                          setFormData(prev => ({ ...prev, file_types: types }));
+                        }}
+                        className="w-3 h-3"
+                      />
+                      {type.toUpperCase()}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Langues (optionnel, sélection multiple)
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { code: 'fr', label: 'Français' },
+                    { code: 'ar', label: 'Arabe' },
+                    { code: 'en', label: 'Anglais' },
+                    { code: 'other', label: 'Autre' }
+                  ].map(lang => (
+                    <label key={lang.code} className="flex items-center gap-1 px-3 py-1 bg-white border rounded text-sm cursor-pointer hover:bg-gray-50">
+                      <input
+                        type="checkbox"
+                        checked={formData.languages.includes(lang.code)}
+                        onChange={(e) => {
+                          const langs = e.target.checked 
+                            ? [...formData.languages, lang.code]
+                            : formData.languages.filter(l => l !== lang.code);
+                          setFormData(prev => ({ ...prev, languages: langs }));
+                        }}
+                        className="w-3 h-3"
+                      />
+                      {lang.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </CollapsibleSection>
+
+            <button
+              onClick={startHarvest}
+              disabled={isLoading || !formData.url || !formData.site_name}
+              className="w-full bg-indigo-600 text-white py-3 px-4 rounded-lg font-semibold hover:bg-indigo-700 disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center justify-center gap-2 transition-colors"
+            >
+              {isLoading ? (
+                <>
+                  <Loader className="w-5 h-5 animate-spin" />
+                  Lancement...
+                </>
+              ) : (
+                <>
+                  <Play className="w-5 h-5" />
+                  Lancer le Moissonnage
+                </>
+              )}
+            </button>
+          </div>
+
+          <div className="bg-white rounded-lg shadow-lg p-6">
+            <h2 className="text-xl font-semibold text-gray-800 mb-4">
+              Statut du Moissonnage
+            </h2>
+
+            {currentJob ? (
+              <div className="space-y-4">
+                <div className="flex items-center gap-3 p-4 bg-gray-50 rounded-lg">
+                  {currentJob.status === 'running' && (
+                    <>
+                      <Loader className="w-6 h-6 text-blue-500 animate-spin" />
+                      <div>
+                        <p className="font-medium text-gray-800">En cours...</p>
+                        <p className="text-sm text-gray-600">
+                          Documents trouvés: {currentJob.documents?.length || 0}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => stopHarvest(currentJob.id)}
+                        className="mt-3 w-full bg-red-600 text-white py-2 px-4 rounded-lg font-semibold hover:bg-red-700 flex items-center justify-center gap-2 transition-colors"
+                      >
+                        ⏹️ Arrêter le moissonnage
+                      </button>
+                    </>
+                  )}
+                  {currentJob.status === 'completed' && (
+                    <>
+                      <CheckCircle className="w-6 h-6 text-green-500" />
+                      <div>
+                        <p className="font-medium text-gray-800">Terminé !</p>
+                        <p className="text-sm text-gray-600">
+                          {currentJob.documents?.length || 0} documents trouvés
+                        </p>
+                      </div>
+                    </>
+                  )}
+                  {currentJob.status === 'error' && (
+                    <>
+                      <XCircle className="w-6 h-6 text-red-500" />
+                      <div>
+                        <p className="font-medium text-gray-800">Erreur</p>
+                        <p className="text-sm text-red-600">{currentJob.error}</p>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {currentJob.status === 'completed' && currentJob.documents?.length > 0 && (
+                  <>
+                    <button
+                      onClick={() => downloadResults(currentJob.id)}
+                      className="w-full bg-green-600 text-white py-2 px-4 rounded-lg font-semibold hover:bg-green-700 flex items-center justify-center gap-2 transition-colors"
+                    >
+                      <Download className="w-5 h-5" />
+                      Télécharger les résultats (JSON)
+                    </button>
+
+                    <div className="border-t pt-4">
+                      <h3 className="font-semibold text-gray-800 mb-2">
+                        Aperçu des documents
+                      </h3>
+                      <div className="space-y-2 max-h-64 overflow-y-auto">
+                        {currentJob.documents.slice(0, 10).map((doc, idx) => (
+                          <div key={idx} className="p-3 bg-gray-50 rounded border border-gray-200">
+                            <p className="font-medium text-sm text-gray-800 truncate">
+                              {doc.title}
+                            </p>
+                            <p className="text-xs text-gray-600 truncate">{doc.url}</p>
+                            {doc.file_size && (
+                              <p className="text-xs text-gray-500">{doc.file_size}</p>
+                            )}
+                          </div>
+                        ))}
+                        {currentJob.documents.length > 10 && (
+                          <p className="text-sm text-gray-500 text-center">
+                            ... et {currentJob.documents.length - 10} autres documents
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="text-center py-12 text-gray-400">
+                <FileText className="w-16 h-16 mx-auto mb-4 opacity-50" />
+                <p>Aucun moissonnage en cours</p>
+                <p className="text-sm">Configurez et lancez un moissonnage pour commencer</p>
+              </div>
+            )}
+          </div>
+            </div>
+
+            <AnalysisSection />
+
+            <div className="bg-white rounded-lg shadow-lg p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xl font-semibold text-gray-800">
+                  Historique des Moissonnages
+                </h2>
+                {selectedJobs.length > 0 && (
+                  <button
+                    onClick={deleteSelectedJobs}
+                    className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center gap-2"
+                  >
+                    🗑️ Supprimer la sélection ({selectedJobs.length})
+                  </button>
+                )}
+              </div>
+
+              {jobs.length > 0 ? (
+                <div className="space-y-2">
+                  {jobs.slice().reverse().map((job) => (
+                    <JobHistoryCard
+                      key={job.id}
+                      job={job}
+                      isSelected={selectedJobs.includes(job.id)}
+                      onToggleSelect={toggleJobSelection}
+                      onDownload={downloadResults}
+                      onViewJson={viewDocumentJson}
+                      onDeleteDoc={deleteDocument}
+                      selectedDocs={selectedDocuments[job.id] || []}
+                      onToggleDoc={toggleDocumentSelection}
+                      onToggleAllDocs={toggleAllDocumentsInJob}
+                      setSelectedDocForAnalysis={setSelectedDocForAnalysis}
+                      setAnalysisJobId={setAnalysisJobId}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div className="text-center py-8 text-gray-400">
+                  <Calendar className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                  <p>Aucun historique</p>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+      {selectedDocForAnalysis && (
+        <DocumentAnalysisPanel
+          document={selectedDocForAnalysis}
+          jobId={analysisJobId}
+          onClose={() => {
+            setSelectedDocForAnalysis(null);
+            setAnalysisJobId(null);
+          }}
+        />
+      )}
+
+      <AssistantPanel />
+    </div>
+  );
+}

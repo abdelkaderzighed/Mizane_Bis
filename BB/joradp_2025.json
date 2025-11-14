@@ -1,0 +1,120 @@
+{
+  "source": "Journal Officiel de la République Algérienne (JORADP)",
+  "base_url": "https://www.joradp.dz",
+  "year": 2025,
+  "harvest_date": "2025-10-11T23:57:17.523003",
+  "harvest_method": "direct_scan",
+  "document_count": 10,
+  "documents": [
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025001.pdf",
+      "number": "001",
+      "title": "Journal Officiel N°001 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "243.6 KB",
+      "last_modified": "Thu, 23 Jan 2025 09:37:50 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025002.pdf",
+      "number": "002",
+      "title": "Journal Officiel N°002 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "515.1 KB",
+      "last_modified": "Mon, 17 Feb 2025 10:24:58 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025003.pdf",
+      "number": "003",
+      "title": "Journal Officiel N°003 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "261.1 KB",
+      "last_modified": "Wed, 22 Jan 2025 15:20:06 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025006.pdf",
+      "number": "006",
+      "title": "Journal Officiel N°006 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "254.5 KB",
+      "last_modified": "Tue, 04 Feb 2025 14:59:56 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025010.pdf",
+      "number": "010",
+      "title": "Journal Officiel N°010 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "307.2 KB",
+      "last_modified": "Thu, 20 Feb 2025 09:58:36 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025011.pdf",
+      "number": "011",
+      "title": "Journal Officiel N°011 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "180.6 KB",
+      "last_modified": "Sun, 23 Feb 2025 10:21:04 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025015.pdf",
+      "number": "015",
+      "title": "Journal Officiel N°015 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "166.4 KB",
+      "last_modified": "Wed, 12 Mar 2025 12:28:12 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025016.pdf",
+      "number": "016",
+      "title": "Journal Officiel N°016 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "251.8 KB",
+      "last_modified": "Mon, 24 Mar 2025 11:13:08 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025018.pdf",
+      "number": "018",
+      "title": "Journal Officiel N°018 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "272.1 KB",
+      "last_modified": "Thu, 13 Mar 2025 15:15:36 GMT"
+    },
+    {
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025020.pdf",
+      "number": "020",
+      "title": "Journal Officiel N°020 - 2025",
+      "year": 2025,
+      "file_type": "pdf",
+      "accessible": true,
+      "status_code": 200,
+      "file_size": "248.3 KB",
+      "last_modified": "Wed, 26 Mar 2025 13:43:00 GMT"
+    }
+  ]
+}

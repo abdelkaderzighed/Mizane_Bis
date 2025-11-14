@@ -1,0 +1,14 @@
+node_modules/
+.env
+node_modules/
+build/
+.env*
+# Fichiers de migration locale - NE JAMAIS COMMITTER
+data_export.sql
+schema_cloud_complete.sql
+.env.local*
+.env.cloud*
+.env.production
+*.backup
+supabase/config.toml
+src/components/TestNewFile.txt

@@ -1,0 +1,11 @@
+Flask
+Flask-Cors
+requests
+beautifulsoup4
+sqlalchemy>=1.4,<3
+anthropic
+pdfplumber
+PyPDF2
+selenium
+python-dotenv
+sentence-transformers

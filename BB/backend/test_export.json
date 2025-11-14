@@ -1,0 +1,333 @@
+{
+  "document_count": 3,
+  "documents": [
+    {
+      "accessible": 1,
+      "added_at": "2025-10-13T19:36:05.289644",
+      "ai_analysis": "{\"summary\": \"Ce Journal Officiel N\u00b0050 du 3 ao\u00fbt 2025 (9 Safar 1447) de la R\u00e9publique Alg\u00e9rienne comprend plusieurs types d'actes officiels. Le pr\u00e9sident Abdelmadjid TEBBOUNE attribue la m\u00e9daille de l'ordre du m\u00e9rite national au rang de 'Athir' au pr\u00e9sident libanais Joseph AOUN. Un d\u00e9cret ex\u00e9cutif important \u00e9tablit les modalit\u00e9s d'inventaire des richesses foresti\u00e8res nationales et leur gestion durable, cr\u00e9ant un cadre r\u00e9glementaire pour la connaissance, le d\u00e9veloppement et la gestion du patrimoine forestier \u00e0 travers des inventaires syst\u00e9matiques et des plans d'am\u00e9nagement. De nombreuses d\u00e9cisions individuelles concernent des changements de noms de famille (notamment Hamira vers Ben Rached, Khergag vers Ben Othmane), ainsi que des mutations importantes dans la magistrature et la s\u00fbret\u00e9 nationale, avec la fin et la nomination de chefs de s\u00fbret\u00e9 de wilayas, pr\u00e9sidents de cours, procureurs g\u00e9n\u00e9raux, et pr\u00e9sidents de tribunaux administratifs. Les arr\u00eat\u00e9s minist\u00e9riels traitent de nominations dans les tribunaux militaires, de la composition de commissions administratives, de l'organisation de bureaux minist\u00e9riels, du classement de monuments historiques (Casbah de Badjouda \u00e0 In Salah et station d'aquaculture de Bousmail), et de la fixation de postes sup\u00e9rieurs pour l'Autorit\u00e9 nationale de protection des donn\u00e9es personnelles.\", \"entities\": {\"organizations\": [\"R\u00e9publique Alg\u00e9rienne D\u00e9mocratique et Populaire\", \"Minist\u00e8re de la D\u00e9fense Nationale\", \"Minist\u00e8re des Moudjahidine et des Ayants Droit\", \"Minist\u00e8re de l'Education Nationale\", \"Minist\u00e8re de la Culture et des Arts\", \"Autorit\u00e9 Nationale de Protection des Donn\u00e9es \u00e0 Caract\u00e8re Personnel\", \"Conseil National des For\u00eats\", \"Organisation Nationale des Moudjahidine\"], \"persons\": [\"Abdelmadjid TEBBOUNE\", \"Joseph AOUN\", \"Mohamed Ennadir LARBAOUI\", \"Zouhir BALLALOU\", \"Mabrouk Lemchounchi\"], \"locations\": [\"Alger\", \"In Salah\", \"Bousmail\", \"Constantine\", \"B\u00e9ja\u00efa\", \"T\u00e9bessa\", \"Ouargla\", \"Chlef\", \"B\u00e9char\", \"Djelfa\", \"S\u00e9tif\", \"Sa\u00efda\", \"M\u00e9d\u00e9a\", \"Blida\", \"Tipaza\", \"Skikda\"], \"dates\": [\"2025-08-03\", \"2025-07-28\", \"2025-07-13\", \"2025-07-19\", \"2025-07-27\", \"2025-07-30\", \"2025-07-20\", \"2025-06-01\", \"2025-07-03\", \"2025-06-30\", \"2025-07-14\"]}, \"document_type\": \"Journal Officiel\", \"main_topics\": [\"D\u00e9crets pr\u00e9sidentiels\", \"Gestion foresti\u00e8re\", \"Mutations administratives\", \"Protection du patrimoine\", \"Organisation administrative\"], \"keywords\": [\"d\u00e9cret\", \"nomination\", \"forestier\", \"inventaire\", \"tribunal\", \"magistrat\", \"changement nom\", \"classement\", \"monument historique\", \"chef s\u00fbret\u00e9\", \"procureur\", \"Casbah Badjouda\", \"patrimoine forestier\", \"gestion durable\"], \"legal_references\": [\"Loi n\u00b0 23-21 du 23 d\u00e9cembre 2023\", \"D\u00e9cret n\u00b0 71-157 du 3 juin 1971\", \"Loi n\u00b0 98-04 du 15 juin 1998\", \"D\u00e9cret ex\u00e9cutif n\u00b0 08-04 du 19 janvier 2008\"], \"effective_date\": \"2025-08-03\", \"analyzed_at\": \"2025-10-14T10:33:31.837152\", \"model_used\": \"claude-sonnet-4-20250514\"}",
+      "analysis": {
+        "analyzed": true,
+        "full_text_available": true,
+        "result": {
+          "analyzed_at": "2025-10-14T10:33:31.837152",
+          "document_type": "Journal Officiel",
+          "effective_date": "2025-08-03",
+          "entities": {
+            "dates": [
+              "2025-08-03",
+              "2025-07-28",
+              "2025-07-13",
+              "2025-07-19",
+              "2025-07-27",
+              "2025-07-30",
+              "2025-07-20",
+              "2025-06-01",
+              "2025-07-03",
+              "2025-06-30",
+              "2025-07-14"
+            ],
+            "locations": [
+              "Alger",
+              "In Salah",
+              "Bousmail",
+              "Constantine",
+              "B\u00e9ja\u00efa",
+              "T\u00e9bessa",
+              "Ouargla",
+              "Chlef",
+              "B\u00e9char",
+              "Djelfa",
+              "S\u00e9tif",
+              "Sa\u00efda",
+              "M\u00e9d\u00e9a",
+              "Blida",
+              "Tipaza",
+              "Skikda"
+            ],
+            "organizations": [
+              "R\u00e9publique Alg\u00e9rienne D\u00e9mocratique et Populaire",
+              "Minist\u00e8re de la D\u00e9fense Nationale",
+              "Minist\u00e8re des Moudjahidine et des Ayants Droit",
+              "Minist\u00e8re de l'Education Nationale",
+              "Minist\u00e8re de la Culture et des Arts",
+              "Autorit\u00e9 Nationale de Protection des Donn\u00e9es \u00e0 Caract\u00e8re Personnel",
+              "Conseil National des For\u00eats",
+              "Organisation Nationale des Moudjahidine"
+            ],
+            "persons": [
+              "Abdelmadjid TEBBOUNE",
+              "Joseph AOUN",
+              "Mohamed Ennadir LARBAOUI",
+              "Zouhir BALLALOU",
+              "Mabrouk Lemchounchi"
+            ]
+          },
+          "keywords": [
+            "d\u00e9cret",
+            "nomination",
+            "forestier",
+            "inventaire",
+            "tribunal",
+            "magistrat",
+            "changement nom",
+            "classement",
+            "monument historique",
+            "chef s\u00fbret\u00e9",
+            "procureur",
+            "Casbah Badjouda",
+            "patrimoine forestier",
+            "gestion durable"
+          ],
+          "legal_references": [
+            "Loi n\u00b0 23-21 du 23 d\u00e9cembre 2023",
+            "D\u00e9cret n\u00b0 71-157 du 3 juin 1971",
+            "Loi n\u00b0 98-04 du 15 juin 1998",
+            "D\u00e9cret ex\u00e9cutif n\u00b0 08-04 du 19 janvier 2008"
+          ],
+          "main_topics": [
+            "D\u00e9crets pr\u00e9sidentiels",
+            "Gestion foresti\u00e8re",
+            "Mutations administratives",
+            "Protection du patrimoine",
+            "Organisation administrative"
+          ],
+          "model_used": "claude-sonnet-4-20250514",
+          "summary": "Ce Journal Officiel N\u00b0050 du 3 ao\u00fbt 2025 (9 Safar 1447) de la R\u00e9publique Alg\u00e9rienne comprend plusieurs types d'actes officiels. Le pr\u00e9sident Abdelmadjid TEBBOUNE attribue la m\u00e9daille de l'ordre du m\u00e9rite national au rang de 'Athir' au pr\u00e9sident libanais Joseph AOUN. Un d\u00e9cret ex\u00e9cutif important \u00e9tablit les modalit\u00e9s d'inventaire des richesses foresti\u00e8res nationales et leur gestion durable, cr\u00e9ant un cadre r\u00e9glementaire pour la connaissance, le d\u00e9veloppement et la gestion du patrimoine forestier \u00e0 travers des inventaires syst\u00e9matiques et des plans d'am\u00e9nagement. De nombreuses d\u00e9cisions individuelles concernent des changements de noms de famille (notamment Hamira vers Ben Rached, Khergag vers Ben Othmane), ainsi que des mutations importantes dans la magistrature et la s\u00fbret\u00e9 nationale, avec la fin et la nomination de chefs de s\u00fbret\u00e9 de wilayas, pr\u00e9sidents de cours, procureurs g\u00e9n\u00e9raux, et pr\u00e9sidents de tribunaux administratifs. Les arr\u00eat\u00e9s minist\u00e9riels traitent de nominations dans les tribunaux militaires, de la composition de commissions administratives, de l'organisation de bureaux minist\u00e9riels, du classement de monuments historiques (Casbah de Badjouda \u00e0 In Salah et station d'aquaculture de Bousmail), et de la fixation de postes sup\u00e9rieurs pour l'Autorit\u00e9 nationale de protection des donn\u00e9es personnelles."
+        },
+        "status": "completed"
+      },
+      "analysis_status": "completed",
+      "analyzed": 1,
+      "downloaded": 1,
+      "file_size": "251.9 KB",
+      "file_type": "pdf",
+      "filename": "F2025050.pdf",
+      "full_text_path": "/Users/djamel/Documents/textes_juridiques_DZ/joradp.dz/2025/F2025050.txt",
+      "id": 4,
+      "last_modified": "Tue, 05 Aug 2025 17:55:08 GMT",
+      "local_path": "/Users/djamel/Documents/textes_juridiques_DZ/joradp.dz/2025/F2025050.pdf",
+      "number": "050",
+      "session_id": 2,
+      "site_id": 1,
+      "title": "Journal Officiel N\u00b0050 - 2025",
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025050.pdf",
+      "year": 2025
+    },
+    {
+      "accessible": 1,
+      "added_at": "2025-10-13T19:36:05.292473",
+      "ai_analysis": "{\"summary\": \"Ce document est le Journal Officiel N\u00b051 de la R\u00e9publique alg\u00e9rienne d\u00e9mocratique et populaire dat\u00e9 du 5 ao\u00fbt 2025 (11 Safar 1447). Il contient principalement un d\u00e9cret ex\u00e9cutif majeur (n\u00b0 25-201) \u00e9tablissant une convention-type entre les organismes de s\u00e9curit\u00e9 sociale et les \u00e9tablissements priv\u00e9s de sant\u00e9 pour le traitement par radioth\u00e9rapie des enfants atteints de cancer. Cette convention d\u00e9finit les conditions de prise en charge, les obligations de chaque partie, les tarifs des actes m\u00e9dicaux et des prestations annexes. Le d\u00e9cret inclut des formulaires d\u00e9taill\u00e9s et des fiches m\u00e9dicales. Le document contient \u00e9galement de nombreuses d\u00e9cisions pr\u00e9sidentielles de changement de nom concernant des citoyens alg\u00e9riens, ainsi que plusieurs d\u00e9crets ex\u00e9cutifs de nomination et de fin de fonctions pour divers postes administratifs. Enfin, il inclut des arr\u00eat\u00e9s minist\u00e9riels concernant l'industrie, le commerce ext\u00e9rieur et la r\u00e9glementation technique des appareils de d\u00e9tection de monoxyde de carbone.\", \"entities\": {\"organizations\": [\"SONELGAZ.SPA\", \"Agence nationale du foncier industriel\", \"Institut national alg\u00e9rien de la propri\u00e9t\u00e9 industrielle\", \"Minist\u00e8re de l'industrie\", \"Minist\u00e8re du commerce ext\u00e9rieur\", \"Minist\u00e8re de la sant\u00e9\", \"Universit\u00e9 de Constantine 3\", \"Universit\u00e9 de Mostaganem\"], \"persons\": [\"Mohamed Ennadir LARBAOUI\", \"Abdelmadjid TEBBOUNE\", \"Mabrouk Kaddour\", \"Messaoud Benzid\", \"Djamel Belkhebez\", \"Smail Maiz\", \"Mohamed Babou\", \"Bouba Bouchair\", \"Sifi GHRIEB\", \"Kamel REZIG\", \"Tayeb ZITOUNI\"], \"locations\": [\"Alger\", \"Constantine\", \"Biskra\", \"Batna\", \"B\u00e9ni Abb\u00e8s\", \"Sidi Bel Abb\u00e8s\", \"M'Sila\", \"El Bayadh\", \"Relizane\", \"Mostaganem\", \"Bordj Bou Arr\u00e9ridj\", \"Oran\", \"B\u00e9char\", \"Djelfa\"], \"dates\": [\"2025-08-05\", \"2025-07-13\", \"2025-07-19\", \"2025-07-23\", \"2025-07-29\", \"2025-06-17\", \"2025-07-08\", \"2025-07-03\", \"2025-06-23\"]}, \"document_type\": \"Journal Officiel\", \"main_topics\": [\"S\u00e9curit\u00e9 sociale et sant\u00e9\", \"Nominations administratives\", \"Changements de nom\", \"Propri\u00e9t\u00e9 industrielle\", \"R\u00e9glementation technique\"], \"keywords\": [\"d\u00e9cret ex\u00e9cutif\", \"radioth\u00e9rapie\", \"cancer enfants\", \"s\u00e9curit\u00e9 sociale\", \"\u00e9tablissements priv\u00e9s\", \"convention-type\", \"changement de nom\", \"nominations\", \"mandataires\", \"propri\u00e9t\u00e9 industrielle\", \"monoxyde de carbone\", \"commerce ext\u00e9rieur\", \"\u0153uvres sociales\", \"tiers payant\", \"tarifs m\u00e9dicaux\"], \"legal_references\": [\"Loi n\u00b0 83-11 du 2 juillet 1983\", \"Loi n\u00b0 08-08 du 16 Safar 1429\", \"Loi n\u00b0 15-12 du 28 Ramadhan 1436\", \"Loi n\u00b0 18-11 du 18 Chaoual 1439\", \"D\u00e9cret n\u00b0 71-157 du 3 juin 1971\", \"D\u00e9cret ex\u00e9cutif n\u00b0 25-201\"], \"effective_date\": \"2025-07-13\", \"analyzed_at\": \"2025-10-14T10:33:52.717675\", \"model_used\": \"claude-sonnet-4-20250514\"}",
+      "analysis": {
+        "analyzed": true,
+        "full_text_available": true,
+        "result": {
+          "analyzed_at": "2025-10-14T10:33:52.717675",
+          "document_type": "Journal Officiel",
+          "effective_date": "2025-07-13",
+          "entities": {
+            "dates": [
+              "2025-08-05",
+              "2025-07-13",
+              "2025-07-19",
+              "2025-07-23",
+              "2025-07-29",
+              "2025-06-17",
+              "2025-07-08",
+              "2025-07-03",
+              "2025-06-23"
+            ],
+            "locations": [
+              "Alger",
+              "Constantine",
+              "Biskra",
+              "Batna",
+              "B\u00e9ni Abb\u00e8s",
+              "Sidi Bel Abb\u00e8s",
+              "M'Sila",
+              "El Bayadh",
+              "Relizane",
+              "Mostaganem",
+              "Bordj Bou Arr\u00e9ridj",
+              "Oran",
+              "B\u00e9char",
+              "Djelfa"
+            ],
+            "organizations": [
+              "SONELGAZ.SPA",
+              "Agence nationale du foncier industriel",
+              "Institut national alg\u00e9rien de la propri\u00e9t\u00e9 industrielle",
+              "Minist\u00e8re de l'industrie",
+              "Minist\u00e8re du commerce ext\u00e9rieur",
+              "Minist\u00e8re de la sant\u00e9",
+              "Universit\u00e9 de Constantine 3",
+              "Universit\u00e9 de Mostaganem"
+            ],
+            "persons": [
+              "Mohamed Ennadir LARBAOUI",
+              "Abdelmadjid TEBBOUNE",
+              "Mabrouk Kaddour",
+              "Messaoud Benzid",
+              "Djamel Belkhebez",
+              "Smail Maiz",
+              "Mohamed Babou",
+              "Bouba Bouchair",
+              "Sifi GHRIEB",
+              "Kamel REZIG",
+              "Tayeb ZITOUNI"
+            ]
+          },
+          "keywords": [
+            "d\u00e9cret ex\u00e9cutif",
+            "radioth\u00e9rapie",
+            "cancer enfants",
+            "s\u00e9curit\u00e9 sociale",
+            "\u00e9tablissements priv\u00e9s",
+            "convention-type",
+            "changement de nom",
+            "nominations",
+            "mandataires",
+            "propri\u00e9t\u00e9 industrielle",
+            "monoxyde de carbone",
+            "commerce ext\u00e9rieur",
+            "\u0153uvres sociales",
+            "tiers payant",
+            "tarifs m\u00e9dicaux"
+          ],
+          "legal_references": [
+            "Loi n\u00b0 83-11 du 2 juillet 1983",
+            "Loi n\u00b0 08-08 du 16 Safar 1429",
+            "Loi n\u00b0 15-12 du 28 Ramadhan 1436",
+            "Loi n\u00b0 18-11 du 18 Chaoual 1439",
+            "D\u00e9cret n\u00b0 71-157 du 3 juin 1971",
+            "D\u00e9cret ex\u00e9cutif n\u00b0 25-201"
+          ],
+          "main_topics": [
+            "S\u00e9curit\u00e9 sociale et sant\u00e9",
+            "Nominations administratives",
+            "Changements de nom",
+            "Propri\u00e9t\u00e9 industrielle",
+            "R\u00e9glementation technique"
+          ],
+          "model_used": "claude-sonnet-4-20250514",
+          "summary": "Ce document est le Journal Officiel N\u00b051 de la R\u00e9publique alg\u00e9rienne d\u00e9mocratique et populaire dat\u00e9 du 5 ao\u00fbt 2025 (11 Safar 1447). Il contient principalement un d\u00e9cret ex\u00e9cutif majeur (n\u00b0 25-201) \u00e9tablissant une convention-type entre les organismes de s\u00e9curit\u00e9 sociale et les \u00e9tablissements priv\u00e9s de sant\u00e9 pour le traitement par radioth\u00e9rapie des enfants atteints de cancer. Cette convention d\u00e9finit les conditions de prise en charge, les obligations de chaque partie, les tarifs des actes m\u00e9dicaux et des prestations annexes. Le d\u00e9cret inclut des formulaires d\u00e9taill\u00e9s et des fiches m\u00e9dicales. Le document contient \u00e9galement de nombreuses d\u00e9cisions pr\u00e9sidentielles de changement de nom concernant des citoyens alg\u00e9riens, ainsi que plusieurs d\u00e9crets ex\u00e9cutifs de nomination et de fin de fonctions pour divers postes administratifs. Enfin, il inclut des arr\u00eat\u00e9s minist\u00e9riels concernant l'industrie, le commerce ext\u00e9rieur et la r\u00e9glementation technique des appareils de d\u00e9tection de monoxyde de carbone."
+        },
+        "status": "completed"
+      },
+      "analysis_status": "completed",
+      "analyzed": 1,
+      "downloaded": 1,
+      "file_size": "175.4 KB",
+      "file_type": "pdf",
+      "filename": "F2025051.pdf",
+      "full_text_path": "/Users/djamel/Documents/textes_juridiques_DZ/joradp.dz/2025/F2025051.txt",
+      "id": 5,
+      "last_modified": "Tue, 12 Aug 2025 10:16:10 GMT",
+      "local_path": "/Users/djamel/Documents/textes_juridiques_DZ/joradp.dz/2025/F2025051.pdf",
+      "number": "051",
+      "session_id": 2,
+      "site_id": 1,
+      "title": "Journal Officiel N\u00b0051 - 2025",
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025051.pdf",
+      "year": 2025
+    },
+    {
+      "accessible": 1,
+      "added_at": "2025-10-13T19:36:05.294651",
+      "ai_analysis": "{\"summary\": \"Ce Journal Officiel de la R\u00e9publique Alg\u00e9rienne n\u00b052 du 7 ao\u00fbt 2025 pr\u00e9sente principalement la Loi n\u00b025-12 du 3 ao\u00fbt 2025 r\u00e9gissant les activit\u00e9s mini\u00e8res, qui remplace la loi mini\u00e8re de 2014. Cette nouvelle loi \u00e9tablit un cadre juridique complet pour la gestion du patrimoine min\u00e9ral alg\u00e9rien, consid\u00e9r\u00e9 comme propri\u00e9t\u00e9 publique et bien de la collectivit\u00e9 nationale. Elle structure les activit\u00e9s en trois volets : l'infrastructure g\u00e9ologique, la recherche mini\u00e8re (prospection et exploration) et l'exploitation mini\u00e8re. La loi cr\u00e9e deux agences mini\u00e8res ind\u00e9pendantes : l'Agence du Service G\u00e9ologique de l'Alg\u00e9rie (ASGA) et l'Agence Nationale des Activit\u00e9s Mini\u00e8res (ANAM). Elle d\u00e9finit les diff\u00e9rents titres et autorisations miniers, avec des dur\u00e9es variables selon le type d'activit\u00e9. Les substances sont class\u00e9es en deux r\u00e9gimes : mines et carri\u00e8res. La loi impose des obligations strictes en mati\u00e8re de s\u00e9curit\u00e9, d'environnement et de contenu local, tout en \u00e9tablissant un droit de pr\u00e9emption pour l'entreprise nationale et une participation minimale de 20% dans les projets d'exploitation de mines impliquant des investisseurs \u00e9trangers. Le document contient \u00e9galement de nombreux d\u00e9crets pr\u00e9sidentiels de nomination et de fin de fonctions de hauts responsables dans diverses institutions publiques.\", \"entities\": {\"organizations\": [\"Agence Nationale des Activit\u00e9s Mini\u00e8res\", \"Agence du Service G\u00e9ologique de l'Alg\u00e9rie\", \"Acad\u00e9mie alg\u00e9rienne de la langue arabe\", \"Haut Conseil de la Langue Arabe\", \"Cour des comptes\", \"Haut Conseil Islamique\", \"Conseil national \u00e9conomique social et environnemental\", \"Minist\u00e8re de la D\u00e9fense Nationale\", \"Minist\u00e8re des Sports\"], \"persons\": [], \"locations\": [\"Alg\u00e9rie\", \"Mila\", \"Bir-Mourad Ra\u00efs\", \"Alger\"], \"dates\": [\"2025-08-07\", \"2025-08-03\", \"2025-07-30\", \"2025-06-28\", \"2025-07-07\"]}, \"document_type\": \"Journal Officiel\", \"main_topics\": [\"Loi mini\u00e8re\", \"Activit\u00e9s mini\u00e8res\", \"Nominations administratives\", \"Agences mini\u00e8res\", \"Patrimoine min\u00e9ral\"], \"keywords\": [\"activit\u00e9s mini\u00e8res\", \"substances min\u00e9rales\", \"permis exploitation\", \"exploration\", \"prospection\", \"carri\u00e8res\", \"agences mini\u00e8res\", \"patrimoine min\u00e9ral\", \"titres miniers\", \"r\u00e9habilitation\", \"environnement\", \"contenu local\", \"d\u00e9crets pr\u00e9sidentiels\", \"nominations\", \"infrastructure g\u00e9ologique\"], \"legal_references\": [\"Loi n\u00b025-12 du 9 Safar 1447\", \"Loi n\u00b014-05 du 24 f\u00e9vrier 2014\", \"Constitution articles 14, 20, 21, 22, 139-24, 143\", \"Ordonnance n\u00b066-155\", \"Loi n\u00b090-30 du 1er d\u00e9cembre 1990\"], \"effective_date\": \"2025-08-03\", \"analyzed_at\": \"2025-10-14T10:35:07.564428\", \"model_used\": \"claude-sonnet-4-20250514\"}",
+      "analysis": {
+        "analyzed": true,
+        "full_text_available": true,
+        "result": {
+          "analyzed_at": "2025-10-14T10:35:07.564428",
+          "document_type": "Journal Officiel",
+          "effective_date": "2025-08-03",
+          "entities": {
+            "dates": [
+              "2025-08-07",
+              "2025-08-03",
+              "2025-07-30",
+              "2025-06-28",
+              "2025-07-07"
+            ],
+            "locations": [
+              "Alg\u00e9rie",
+              "Mila",
+              "Bir-Mourad Ra\u00efs",
+              "Alger"
+            ],
+            "organizations": [
+              "Agence Nationale des Activit\u00e9s Mini\u00e8res",
+              "Agence du Service G\u00e9ologique de l'Alg\u00e9rie",
+              "Acad\u00e9mie alg\u00e9rienne de la langue arabe",
+              "Haut Conseil de la Langue Arabe",
+              "Cour des comptes",
+              "Haut Conseil Islamique",
+              "Conseil national \u00e9conomique social et environnemental",
+              "Minist\u00e8re de la D\u00e9fense Nationale",
+              "Minist\u00e8re des Sports"
+            ],
+            "persons": []
+          },
+          "keywords": [
+            "activit\u00e9s mini\u00e8res",
+            "substances min\u00e9rales",
+            "permis exploitation",
+            "exploration",
+            "prospection",
+            "carri\u00e8res",
+            "agences mini\u00e8res",
+            "patrimoine min\u00e9ral",
+            "titres miniers",
+            "r\u00e9habilitation",
+            "environnement",
+            "contenu local",
+            "d\u00e9crets pr\u00e9sidentiels",
+            "nominations",
+            "infrastructure g\u00e9ologique"
+          ],
+          "legal_references": [
+            "Loi n\u00b025-12 du 9 Safar 1447",
+            "Loi n\u00b014-05 du 24 f\u00e9vrier 2014",
+            "Constitution articles 14, 20, 21, 22, 139-24, 143",
+            "Ordonnance n\u00b066-155",
+            "Loi n\u00b090-30 du 1er d\u00e9cembre 1990"
+          ],
+          "main_topics": [
+            "Loi mini\u00e8re",
+            "Activit\u00e9s mini\u00e8res",
+            "Nominations administratives",
+            "Agences mini\u00e8res",
+            "Patrimoine min\u00e9ral"
+          ],
+          "model_used": "claude-sonnet-4-20250514",
+          "summary": "Ce Journal Officiel de la R\u00e9publique Alg\u00e9rienne n\u00b052 du 7 ao\u00fbt 2025 pr\u00e9sente principalement la Loi n\u00b025-12 du 3 ao\u00fbt 2025 r\u00e9gissant les activit\u00e9s mini\u00e8res, qui remplace la loi mini\u00e8re de 2014. Cette nouvelle loi \u00e9tablit un cadre juridique complet pour la gestion du patrimoine min\u00e9ral alg\u00e9rien, consid\u00e9r\u00e9 comme propri\u00e9t\u00e9 publique et bien de la collectivit\u00e9 nationale. Elle structure les activit\u00e9s en trois volets : l'infrastructure g\u00e9ologique, la recherche mini\u00e8re (prospection et exploration) et l'exploitation mini\u00e8re. La loi cr\u00e9e deux agences mini\u00e8res ind\u00e9pendantes : l'Agence du Service G\u00e9ologique de l'Alg\u00e9rie (ASGA) et l'Agence Nationale des Activit\u00e9s Mini\u00e8res (ANAM). Elle d\u00e9finit les diff\u00e9rents titres et autorisations miniers, avec des dur\u00e9es variables selon le type d'activit\u00e9. Les substances sont class\u00e9es en deux r\u00e9gimes : mines et carri\u00e8res. La loi impose des obligations strictes en mati\u00e8re de s\u00e9curit\u00e9, d'environnement et de contenu local, tout en \u00e9tablissant un droit de pr\u00e9emption pour l'entreprise nationale et une participation minimale de 20% dans les projets d'exploitation de mines impliquant des investisseurs \u00e9trangers. Le document contient \u00e9galement de nombreux d\u00e9crets pr\u00e9sidentiels de nomination et de fin de fonctions de hauts responsables dans diverses institutions publiques."
+        },
+        "status": "completed"
+      },
+      "analysis_status": "completed",
+      "analyzed": 1,
+      "downloaded": 1,
+      "file_size": "307.4 KB",
+      "file_type": "pdf",
+      "filename": "F2025052.pdf",
+      "full_text_path": "/Users/djamel/Documents/textes_juridiques_DZ/joradp.dz/2025/F2025052.txt",
+      "id": 6,
+      "last_modified": "Sun, 10 Aug 2025 16:21:04 GMT",
+      "local_path": "/Users/djamel/Documents/textes_juridiques_DZ/joradp.dz/2025/F2025052.pdf",
+      "number": "052",
+      "session_id": 2,
+      "site_id": 1,
+      "title": "Journal Officiel N\u00b0052 - 2025",
+      "url": "https://www.joradp.dz/FTP/JO-FRANCAIS/2025/F2025052.pdf",
+      "year": 2025
+    }
+  ],
+  "export_date": "2025-10-14T10:35:38.248776",
+  "include_analysis": true,
+  "job_id": "e4ac3434-854a-4a8f-9159-a824fd67af9d",
+  "statistics": {
+    "duplicates_removed": 0,
+    "new_documents": 3,
+    "total_found": 3
+  }
+}

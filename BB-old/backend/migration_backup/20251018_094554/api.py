@@ -1,0 +1,3314 @@
+"""
+API Flask pour le Moissonneur de Documents
+Backend avec persistance SQLite + Téléchargement automatique des fichiers
+"""
+
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+import json
+from datetime import datetime, timedelta
+import threading
+import uuid
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, unquote
+from analysis import get_api_key, process_single_document, get_embedding_model, EMBEDDING_MODEL_NAME
+from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import sqlite3
+from contextlib import contextmanager
+import os
+import re
+import copy
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
+
+# Configuration
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = os.getenv("HARVESTER_DB_PATH", str(BASE_DIR / "harvester.db"))
+DEFAULT_STORAGE = Path.home() / "Documents" / "textes_juridiques_DZ"
+STORAGE_BASE_PATH = os.getenv("HARVESTER_STORAGE_PATH", str(DEFAULT_STORAGE))
+
+SCHEDULE_INTERVALS = {
+    'manual': None,
+    'hourly': timedelta(hours=1),
+    '6h': timedelta(hours=6),
+    'daily': timedelta(days=1),
+    'weekly': timedelta(days=7),
+    'monthly': timedelta(days=30),
+}
+
+
+def parse_timestamp(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value)
+        except (OSError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace('Z', '').replace(' ', 'T')
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def compute_next_run_at(frequency_key, reference_dt, now):
+    delta = SCHEDULE_INTERVALS.get(str(frequency_key))
+    if not delta:
+        return None
+    anchor = reference_dt or now
+    if anchor is None:
+        return None
+    next_dt = anchor + delta
+    if next_dt <= now:
+        step_seconds = delta.total_seconds()
+        if step_seconds <= 0:
+            return None
+        # Avancer jusqu'à dépasser "now"
+        seconds_ahead = (now - anchor).total_seconds()
+        steps = int(seconds_ahead // step_seconds) + 1
+        next_dt = anchor + delta * max(steps, 1)
+    return next_dt.isoformat()
+
+
+# ============================================================================
+# FONCTIONS DE GESTION DES FICHIERS
+# ============================================================================
+
+def sanitize_filename(filename):
+    """
+    Transforme un nom de fichier ou URL en nom de fichier sûr.
+    Remplace les caractères problématiques par des underscores.
+    """
+    # Enlever le protocole si présent
+    filename = re.sub(r'^https?://', '', filename)
+    
+    # Remplacer les caractères non autorisés par _
+    safe_name = re.sub(r'[<>:"/\\|?*]', '_', filename)
+    
+    # Limiter la longueur (max 200 caractères + extension)
+    if len(safe_name) > 200:
+        # Garder l'extension
+        name_parts = safe_name.rsplit('.', 1)
+        if len(name_parts) == 2:
+            base, ext = name_parts
+            safe_name = base[:200] + '.' + ext
+        else:
+            safe_name = safe_name[:200]
+    
+    return safe_name
+
+
+def get_site_name_from_url(url):
+    """Extrait le hostname d'une URL pour l'utiliser comme nom de site"""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or parsed.netloc
+        # Enlever www. si présent
+        return hostname.replace('www.', '') if hostname else 'unknown_site'
+    except:
+        return 'unknown_site'
+
+
+def get_storage_path(base_url, site_name=None, subfolder=None):
+    """
+    Retourne le chemin complet du répertoire de stockage.
+    
+    Args:
+        base_url: URL de base du site
+        site_name: Nom personnalisé du site (optionnel)
+        subfolder: Sous-dossier (année ou autre) (optionnel)
+    
+    Returns:
+        Chemin complet du répertoire
+    """
+    # Déterminer le nom du site
+    if site_name:
+        site_folder = sanitize_filename(site_name)
+    else:
+        site_folder = get_site_name_from_url(base_url)
+    
+    # Construire le chemin
+    path = os.path.join(STORAGE_BASE_PATH, site_folder)
+    
+    # Ajouter le sous-dossier si spécifié
+    if subfolder:
+        subfolder_clean = sanitize_filename(str(subfolder))
+        path = os.path.join(path, subfolder_clean)
+    
+    return path
+
+
+def download_document(url, storage_path, timeout=60):
+    """
+    Télécharge un document depuis une URL et le sauvegarde.
+    
+    Args:
+        url: URL du document
+        storage_path: Chemin complet du répertoire de destination
+        timeout: Timeout en secondes
+    
+    Returns:
+        tuple: (success: bool, local_path: str or None, error: str or None)
+    """
+    try:
+        # Créer le répertoire si nécessaire
+        os.makedirs(storage_path, exist_ok=True)
+        
+        # Générer le nom du fichier à partir de l'URL
+        parsed_url = urlparse(url)
+        original_filename = unquote(parsed_url.path.split('/')[-1])
+        
+        # Si pas de nom de fichier dans l'URL, en créer un
+        if not original_filename or '.' not in original_filename:
+            # Utiliser toute l'URL comme nom
+            original_filename = sanitize_filename(url)
+            # Ajouter .pdf par défaut si pas d'extension
+            if '.' not in original_filename:
+                original_filename += '.pdf'
+        else:
+            original_filename = sanitize_filename(original_filename)
+        
+        # Chemin complet du fichier
+        local_path = os.path.join(storage_path, original_filename)
+        
+        # Vérifier si le fichier existe déjà
+        if os.path.exists(local_path):
+            print(f"   ⏭️  Fichier existe déjà : {original_filename}")
+            return True, local_path, None
+        
+        # Télécharger le fichier
+        print(f"   📥 Téléchargement : {original_filename}...")
+        response = requests.get(url, timeout=timeout, stream=True)
+        response.raise_for_status()
+        
+        # Sauvegarder le fichier
+        with open(local_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        file_size = os.path.getsize(local_path)
+        print(f"   ✅ Téléchargé : {original_filename} ({file_size} bytes)")
+        
+        return True, local_path, None
+        
+    except requests.exceptions.Timeout:
+        error = f"Timeout lors du téléchargement de {url}"
+        print(f"   ⏱️  {error}")
+        return False, None, error
+        
+    except requests.exceptions.RequestException as e:
+        error = f"Erreur HTTP : {str(e)}"
+        print(f"   ❌ {error}")
+        return False, None, error
+        
+    except Exception as e:
+        error = f"Erreur : {str(e)}"
+        print(f"   ❌ {error}")
+        return False, None, error
+
+
+def get_document_by_id(doc_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def collect_document_internal(doc_id, stop_event=None):
+    doc = get_document_by_id(doc_id)
+    if not doc:
+        return False, "Document introuvable", 'error'
+    if stop_event and stop_event.is_set():
+        return False, "Opération interrompue", 'stopped'
+
+    url = doc.get('url')
+    if not url:
+        return False, "URL manquante", 'error'
+
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=10)
+        status_code = response.status_code
+        accessible = 1 if status_code < 400 else 0
+        content_length = response.headers.get('Content-Length')
+        last_modified = response.headers.get('Last-Modified')
+        error_message = None
+    except requests.RequestException as exc:
+        accessible = 0
+        content_length = None
+        last_modified = None
+        status_code = None
+        error_message = str(exc)
+
+    if stop_event and stop_event.is_set():
+        return False, "Opération interrompue", 'stopped'
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE documents
+            SET accessible = ?, 
+                file_size = CASE WHEN ? IS NOT NULL THEN ? ELSE file_size END,
+                last_modified = COALESCE(?, last_modified)
+            WHERE id = ?
+            """,
+            (
+                accessible,
+                content_length,
+                str(content_length) if content_length is not None else None,
+                last_modified,
+                doc_id,
+            ),
+        )
+        conn.commit()
+
+    if accessible:
+        return True, {'status_code': status_code}, 'completed'
+    message = error_message or (f"Statut HTTP {status_code}" if status_code is not None else "Inaccessible")
+    return False, message, 'error'
+
+
+def redownload_document_internal(doc_id, stop_event=None):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT d.*, hs.parameters_id, s.base_url
+            FROM documents d
+            JOIN harvest_sessions hs ON d.session_id = hs.id
+            JOIN sites s ON d.site_id = s.id
+            WHERE d.id = ?
+            """,
+            (doc_id,),
+        )
+        doc = cursor.fetchone()
+    if not doc:
+        return False, "Document introuvable", 'error'
+
+    if stop_event and stop_event.is_set():
+        return False, "Opération interrompue", 'stopped'
+
+    parameters_id = doc['parameters_id']
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT data FROM harvest_parameters WHERE id = ?", (parameters_id,))
+        params_row = cursor.fetchone()
+    params = json.loads(params_row['data']) if params_row else {}
+
+    storage_path = get_storage_path(
+        doc['base_url'],
+        params.get('site_name'),
+        params.get('subfolder') or params.get('year'),
+    )
+
+    if stop_event and stop_event.is_set():
+        return False, "Opération interrompue", 'stopped'
+
+    success, local_path, error = download_document(
+        doc['url'],
+        storage_path,
+        timeout=int(params.get('timeout', 60)),
+    )
+
+    if stop_event and stop_event.is_set():
+        return False, "Opération interrompue", 'stopped'
+
+    if success:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE documents
+                SET local_path = ?, downloaded = 1, accessible = 1
+                WHERE id = ?
+                """,
+                (local_path, doc_id),
+            )
+            conn.commit()
+        return True, {'local_path': local_path}, 'completed'
+
+    return False, error or "Erreur lors du téléchargement", 'error'
+
+
+def analyze_document_internal(doc_id, stop_event=None):
+    api_key = get_api_key()
+    if not api_key:
+        return False, "Clé API indisponible", 'error'
+
+    result = process_single_document(doc_id, api_key, stop_event=stop_event)
+    status = result.get('status') or ('completed' if result.get('success') else 'error')
+
+    if status == 'completed':
+        return True, result, 'completed'
+    if status == 'stopped':
+        return False, result.get('error') or "Opération interrompue", 'stopped'
+    return False, result.get('error') or "Erreur d'analyse", 'error'
+
+
+def has_running_document_job(doc_id, phase):
+    for job in document_jobs.values():
+        if job['doc_id'] == doc_id and job['phase'] == phase and job['status'] == 'running':
+            return True
+    return False
+
+
+def create_document_job(doc_id, phase):
+    if phase not in DOCUMENT_PHASES:
+        raise ValueError("Phase inconnue")
+
+    doc = get_document_by_id(doc_id)
+    if not doc:
+        raise LookupError("Document introuvable")
+
+    if has_running_document_job(doc_id, phase):
+        raise RuntimeError("Une opération est déjà en cours sur ce document")
+
+    job_id = str(uuid.uuid4())
+    stop_event = threading.Event()
+    document_jobs[job_id] = {
+        'job_id': job_id,
+        'doc_id': doc_id,
+        'phase': phase,
+        'status': 'pending',
+        'stop_event': stop_event,
+        'requested_action': None,
+        'error': None,
+        'result': None,
+        'started_at': None,
+        'completed_at': None,
+        'created_at': datetime.now().isoformat(),
+    }
+
+    thread = threading.Thread(target=run_document_job, args=(job_id,), daemon=True)
+    document_jobs[job_id]['thread'] = thread
+    thread.start()
+    return job_id
+
+
+def run_document_job(job_id):
+    job = document_jobs.get(job_id)
+    if not job:
+        return
+
+    stop_event = job['stop_event']
+    doc_id = job['doc_id']
+    phase = job['phase']
+
+    job['status'] = 'running'
+    job['started_at'] = datetime.now().isoformat()
+
+    try:
+        if phase == 'collect':
+            success, info, state = collect_document_internal(doc_id, stop_event)
+        elif phase == 'download':
+            success, info, state = redownload_document_internal(doc_id, stop_event)
+        elif phase == 'analyze':
+            success, info, state = analyze_document_internal(doc_id, stop_event)
+        else:
+            job['status'] = 'error'
+            job['error'] = 'Phase inconnue'
+            return
+
+        if state == 'stopped':
+            requested = job.get('requested_action')
+            job['status'] = 'cancelled' if requested == 'cancel' else 'stopped'
+            job['error'] = None if job['status'] == 'stopped' else 'Opération annulée'
+            return
+
+        if success:
+            job['status'] = 'completed'
+            job['result'] = info
+        else:
+            job['status'] = 'error'
+            job['error'] = info
+    except Exception as exc:
+        job['status'] = 'error'
+        job['error'] = str(exc)
+    finally:
+        job['completed_at'] = datetime.now().isoformat()
+        if job['status'] != 'running':
+            job['requested_action'] = None
+        job.pop('thread', None)
+
+
+def serialize_document_job(job_id):
+    job = document_jobs.get(job_id)
+    if not job:
+        return None
+    return {
+        'job_id': job_id,
+        'doc_id': job['doc_id'],
+        'phase': job['phase'],
+        'status': job['status'],
+        'requested_action': job.get('requested_action'),
+        'error': job.get('error'),
+        'result': job.get('result'),
+        'created_at': job.get('created_at'),
+        'started_at': job.get('started_at'),
+        'completed_at': job.get('completed_at'),
+        'resume_of': job.get('resume_of'),
+    }
+
+def delete_local_file(local_path):
+    """
+    Supprime un fichier local.
+    
+    Args:
+        local_path: Chemin complet du fichier
+    
+    Returns:
+        bool: True si succès, False sinon
+    """
+    if not local_path or not os.path.exists(local_path):
+        return True
+    
+    try:
+        # Supprimer le fichier principal
+        os.remove(local_path)
+        print(f"   🗑️  Fichier supprimé : {local_path}")
+        
+        # Supprimer aussi le fichier .txt associé (texte extrait)
+        txt_path = os.path.splitext(local_path)[0] + '.txt'
+        if os.path.exists(txt_path):
+            os.remove(txt_path)
+            print(f"   🗑️  Fichier texte supprimé : {txt_path}")
+        
+        # Supprimer le répertoire parent s'il est vide
+        parent_dir = os.path.dirname(local_path)
+        if os.path.exists(parent_dir) and not os.listdir(parent_dir):
+            os.rmdir(parent_dir)
+            print(f"   🗑️  Répertoire vide supprimé : {parent_dir}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"   ❌ Erreur suppression fichier : {e}")
+        return False
+
+
+# ============================================================================
+# FONCTIONS DE BASE DE DONNÉES
+# ============================================================================
+
+@contextmanager
+def get_db_connection():
+    """Context manager pour les connexions à la base de données"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+
+def ensure_archive_tables():
+    """Crée les tables d'archive génériques si elles n'existent pas."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS site_archive (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id INTEGER NOT NULL,
+                identifier TEXT NOT NULL,
+                year INTEGER,
+                number INTEGER,
+                language TEXT,
+                url TEXT NOT NULL,
+                filename TEXT,
+                status TEXT NOT NULL DEFAULT 'checking',
+                local_path TEXT,
+                file_size INTEGER,
+                scan_attempts INTEGER NOT NULL DEFAULT 0,
+                download_attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                metadata TEXT,
+                first_checked TEXT,
+                last_checked TEXT,
+                downloaded_at TEXT,
+                updated_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(site_id, identifier)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS site_archive_scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id INTEGER NOT NULL,
+                scan_type TEXT NOT NULL,
+                parameters TEXT,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                total_checked INTEGER NOT NULL DEFAULT 0,
+                found_available INTEGER NOT NULL DEFAULT 0,
+                found_errors INTEGER NOT NULL DEFAULT 0,
+                log_details TEXT
+            )
+        """)
+
+
+# S'assurer que les tables existent au démarrage du service
+ensure_archive_tables()
+
+archive_scan_jobs = {}
+archive_scan_lock = threading.Lock()
+
+
+def load_site_with_parameters(site_id):
+    """Retourne le site et les paramètres de moissonnage actifs."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM sites WHERE id = ?", (site_id,))
+        site = cursor.fetchone()
+        if not site:
+            return None, None
+
+        params_row = None
+        if site['current_parameters_id']:
+            cursor.execute(
+                "SELECT data FROM harvest_parameters WHERE id = ?",
+                (site['current_parameters_id'],),
+            )
+            params_row = cursor.fetchone()
+
+        if not params_row:
+            cursor.execute(
+                "SELECT data FROM harvest_parameters WHERE site_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (site_id,),
+            )
+            params_row = cursor.fetchone()
+
+        params = {}
+        if params_row and params_row['data']:
+            try:
+                params = json.loads(params_row['data'])
+            except json.JSONDecodeError:
+                params = {}
+
+        return dict(site), params
+
+
+def resolve_archive_config(site, params, overrides=None):
+    """Construit la configuration d'archivage à partir des paramètres."""
+    overrides = overrides or {}
+    archive_cfg = params.get('archive') or params.get('archive_config') or {}
+
+    def _to_int(value, default):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _to_float(value, default):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    languages = archive_cfg.get('languages') or params.get('languages') or []
+    if isinstance(languages, str):
+        languages = [languages]
+    languages = [lang for lang in languages if lang]
+
+    config = {
+        'url_pattern': archive_cfg.get('url_pattern'),
+        'identifier_template': archive_cfg.get('identifier_template'),
+        'languages': languages,
+        'max_search': _to_int(archive_cfg.get('max_search'), 400),
+        'start_number': _to_int(archive_cfg.get('start_number'), max(_to_int(params.get('start'), 1), 1)),
+        'number_padding': _to_int(archive_cfg.get('number_padding'), 3),
+        'retry_count': _to_int(archive_cfg.get('retry_count') or params.get('retry_count'), 3),
+        'timeout': _to_float(archive_cfg.get('timeout') or params.get('timeout'), 30),
+        'retry_delay': _to_float(archive_cfg.get('retry_delay') or params.get('retry_delay'), 2),
+        'delay_between': _to_float(archive_cfg.get('delay_between') or params.get('delay_between'), 0.5),
+        'site_base_url': site.get('base_url'),
+    }
+
+    # Configuration spécifique JORADP par défaut
+    if params.get('harvester_type') == 'joradp' and not config['url_pattern']:
+        config['url_pattern'] = (
+            "https://www.joradp.dz/FTP/{language}/{year}/F{year}{number:03d}.pdf"
+        )
+        config['identifier_template'] = "F{year}{number:03d}"
+        if not config['languages']:
+            config['languages'] = ['JO-FRANCAIS', 'jo-francais']
+        config['max_search'] = 400
+        config['start_number'] = 1
+        config['number_padding'] = 3
+
+    # Intégrer les overrides fournis par l'appelant
+    for key, value in (overrides or {}).items():
+        if value is None:
+            continue
+        if key == 'languages':
+            if isinstance(value, str):
+                config['languages'] = [value]
+            elif isinstance(value, list):
+                config['languages'] = [v for v in value if v]
+        elif key in {'max_search', 'start_number', 'number_padding', 'retry_count'}:
+            config[key] = _to_int(value, config[key])
+        elif key in {'timeout', 'retry_delay', 'delay_between'}:
+            config[key] = _to_float(value, config[key])
+        elif key in {'url_pattern', 'identifier_template'}:
+            config[key] = value
+
+    if not config['url_pattern']:
+        raise ValueError(
+            "Aucun motif d'URL trouvé pour ce site. "
+            "Définissez 'archive.url_pattern' dans les paramètres ou fournissez-le dans la requête."
+        )
+
+    if not config['identifier_template']:
+        padding = config.get('number_padding', 3)
+        config['identifier_template'] = f"doc-{{year}}-{{number:0{padding}d}}"
+
+    if not config['languages']:
+        # Permettre un motif sans langue
+        config['languages'] = ['']
+
+    return config
+
+
+def create_scan_record(site_id, scan_type, parameters=None):
+    ensure_archive_tables()
+    now = datetime.now().isoformat()
+    payload = json.dumps(parameters or {}, ensure_ascii=False)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO site_archive_scans (
+                site_id, scan_type, parameters, started_at, status,
+                total_checked, found_available, found_errors
+            )
+            VALUES (?, ?, ?, ?, 'running', 0, 0, 0)
+            """,
+            (site_id, scan_type, payload, now),
+        )
+        return cursor.lastrowid
+
+
+def update_scan_progress(scan_id, totals):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE site_archive_scans
+               SET total_checked = ?, found_available = ?, found_errors = ?
+             WHERE id = ?
+            """,
+            (totals['checked'], totals['available'], totals['errors'], scan_id),
+        )
+
+
+def finalize_scan_record(scan_id, status, totals=None, log=None):
+    now = datetime.now().isoformat()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if totals:
+            cursor.execute(
+                """
+                UPDATE site_archive_scans
+                   SET status = ?,
+                       completed_at = ?,
+                       log_details = COALESCE(?, log_details),
+                       total_checked = ?,
+                       found_available = ?,
+                       found_errors = ?
+                 WHERE id = ?
+                """,
+                (
+                    status,
+                    now,
+                    log,
+                    totals['checked'],
+                    totals['available'],
+                    totals['errors'],
+                    scan_id,
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE site_archive_scans
+                   SET status = ?,
+                       completed_at = ?,
+                       log_details = COALESCE(?, log_details)
+                 WHERE id = ?
+                """,
+                (status, now, log, scan_id),
+            )
+
+
+def build_identifier(config, year, number):
+    template = config.get('identifier_template')
+    values = {
+        'year': year,
+        'number': number,
+        'number_padded': str(number).zfill(config.get('number_padding', 3)),
+    }
+    return template.format(**values)
+
+
+def build_url(config, language, year, number):
+    values = {
+        'language': language,
+        'year': year,
+        'number': number,
+        'number_padded': str(number).zfill(config.get('number_padding', 3)),
+        'site_base_url': config.get('site_base_url'),
+    }
+    return config['url_pattern'].format(**values)
+
+
+def check_site_document(config, year, number):
+    """Vérifie l'existence d'un document en utilisant le motif configuré."""
+    languages = config.get('languages') or ['']
+    retry_count = config.get('retry_count', 3)
+    timeout = config.get('timeout', 30)
+    retry_delay = config.get('retry_delay', 2)
+
+    last_result = {
+        'available': False,
+        'language': languages[-1] if languages else '',
+        'url': None,
+        'file_size': None,
+        'status': 'error_404',
+        'error': 'Document non trouvé'
+    }
+
+    for language in languages:
+        try:
+            url = build_url(config, language, year, number)
+        except KeyError as exc:
+            raise ValueError(f"Champ manquant dans url_pattern: {exc}") from exc
+
+        for attempt in range(retry_count):
+            try:
+                response = requests.head(url, timeout=timeout, allow_redirects=True)
+                if response.status_code == 200:
+                    size_header = response.headers.get('content-length')
+                    file_size = int(size_header) if size_header and size_header.isdigit() else None
+                    return {
+                        'available': True,
+                        'language': language,
+                        'url': url,
+                        'file_size': file_size,
+                        'status': 'available',
+                        'error': None
+                    }
+                if response.status_code == 404:
+                    last_result = {
+                        'available': False,
+                        'language': language,
+                        'url': url,
+                        'file_size': None,
+                        'status': 'error_404',
+                        'error': 'Document non trouvé'
+                    }
+                    break
+
+                last_result = {
+                    'available': False,
+                    'language': language,
+                    'url': url,
+                    'file_size': None,
+                    'status': f'error_http_{response.status_code}',
+                    'error': f'Statut HTTP {response.status_code}'
+                }
+                if attempt < retry_count - 1:
+                    time.sleep(retry_delay)
+                    continue
+                break
+            except requests.exceptions.Timeout:
+                last_result = {
+                    'available': False,
+                    'language': language,
+                    'url': url,
+                    'file_size': None,
+                    'status': 'error_timeout',
+                    'error': 'Timeout lors de la requête HEAD'
+                }
+                if attempt < retry_count - 1:
+                    time.sleep(retry_delay)
+                    continue
+                break
+            except Exception as exc:
+                last_result = {
+                    'available': False,
+                    'language': language,
+                    'url': url,
+                    'file_size': None,
+                    'status': 'error_other',
+                    'error': str(exc)
+                }
+                if attempt < retry_count - 1:
+                    time.sleep(retry_delay)
+                    continue
+                break
+
+        if last_result['available']:
+            return last_result
+
+    return last_result
+
+
+def find_site_year_max(config, year):
+    """Recherche le numéro maximal disponible pour une année."""
+    start_number = config.get('start_number', 1)
+    max_search = config.get('max_search', 400)
+
+    first = check_site_document(config, year, start_number)
+    if not first['available']:
+        raise ValueError(f"Aucun document trouvé pour l'année {year}")
+
+    left, right = start_number, max_search
+    last_found = start_number
+
+    while left <= right:
+        mid = (left + right) // 2
+        result = check_site_document(config, year, mid)
+        if result['available']:
+            last_found = mid
+            left = mid + 1
+        else:
+            right = mid - 1
+
+    return last_found
+
+
+def upsert_site_archive_record(cursor, site_id, identifier, year, number, language, url, status, file_size, error_message, metadata):
+    now = datetime.now().isoformat()
+    filename = url.split('/')[-1] if url else None
+    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+    cursor.execute(
+        """
+        INSERT INTO site_archive (
+            site_id, identifier, year, number, language, url, filename, status,
+            local_path, file_size, scan_attempts, download_attempts, last_error,
+            metadata, first_checked, last_checked, downloaded_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, ?, ?, ?, ?, NULL, ?)
+        ON CONFLICT(site_id, identifier) DO UPDATE SET
+            year = COALESCE(excluded.year, site_archive.year),
+            number = COALESCE(excluded.number, site_archive.number),
+            language = excluded.language,
+            url = excluded.url,
+            filename = excluded.filename,
+            status = excluded.status,
+            file_size = COALESCE(excluded.file_size, site_archive.file_size),
+            scan_attempts = site_archive.scan_attempts + 1,
+            last_error = excluded.last_error,
+            metadata = COALESCE(excluded.metadata, site_archive.metadata),
+            first_checked = COALESCE(site_archive.first_checked, excluded.first_checked),
+            last_checked = excluded.last_checked,
+            updated_at = excluded.updated_at
+        """,
+        (
+            site_id,
+            identifier,
+            year,
+            number,
+            language,
+            url,
+            filename,
+            status,
+            file_size,
+            error_message,
+            metadata_json,
+            now,
+            now,
+            now,
+        ),
+    )
+
+
+def run_site_archive_scan_year(scan_id, site, year, config):
+    totals = {'checked': 0, 'available': 0, 'errors': 0}
+    delay_between = config.get('delay_between', 0.5)
+
+    try:
+        max_number = find_site_year_max(config, year)
+        with archive_scan_lock:
+            job = archive_scan_jobs.get(scan_id, {})
+            job.update({'total': max_number, 'status': 'running'})
+            archive_scan_jobs[scan_id] = job
+
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            for number in range(config.get('start_number', 1), max_number + 1):
+                result = check_site_document(config, year, number)
+                status = 'available' if result['available'] else result['status']
+                error_message = result.get('error')
+                identifier = build_identifier(config, year, number)
+                metadata = {
+                    'year': year,
+                    'number': number,
+                    'language': result.get('language'),
+                    'site_id': site['id']
+                }
+
+                upsert_site_archive_record(
+                    cursor,
+                    site['id'],
+                    identifier,
+                    year,
+                    number,
+                    result.get('language'),
+                    result.get('url'),
+                    status,
+                    result.get('file_size'),
+                    error_message,
+                    metadata,
+                )
+
+                totals['checked'] += 1
+                if result['available']:
+                    totals['available'] += 1
+                elif status.startswith('error'):
+                    totals['errors'] += 1
+
+                if totals['checked'] % 10 == 0 or number == max_number:
+                    conn.commit()
+                    update_scan_progress(scan_id, totals)
+
+                with archive_scan_lock:
+                    job = archive_scan_jobs.get(scan_id, {})
+                    job.update({
+                        'checked': totals['checked'],
+                        'available': totals['available'],
+                        'errors': totals['errors'],
+                        'last_number': number,
+                        'status': 'running'
+                    })
+                    archive_scan_jobs[scan_id] = job
+
+                if delay_between:
+                    time.sleep(delay_between)
+
+            conn.commit()
+
+        finalize_scan_record(scan_id, 'completed', totals)
+        with archive_scan_lock:
+            job = archive_scan_jobs.get(scan_id, {})
+            job.update({'status': 'completed', 'completed_at': datetime.now().isoformat()})
+            archive_scan_jobs[scan_id] = job
+
+    except Exception as exc:
+        log_message = str(exc)
+        finalize_scan_record(scan_id, 'error', totals, log_message)
+        with archive_scan_lock:
+            job = archive_scan_jobs.get(scan_id, {})
+            job.update({'status': 'error', 'error': log_message})
+            archive_scan_jobs[scan_id] = job
+
+
+def start_site_archive_scan_year(site_id, year, overrides=None):
+    site, params = load_site_with_parameters(site_id)
+    if not site:
+        raise ValueError(f"Site {site_id} introuvable")
+
+    config = resolve_archive_config(site, params, overrides or {})
+    scan_id = create_scan_record(site_id, 'year', parameters={'year': year, 'config': config})
+
+    with archive_scan_lock:
+        archive_scan_jobs[scan_id] = {
+            'status': 'running',
+            'site_id': site_id,
+            'year_start': year,
+            'year_end': year,
+            'checked': 0,
+            'available': 0,
+            'errors': 0,
+            'total': None,
+            'config': config,
+        }
+
+    thread = threading.Thread(
+        target=run_site_archive_scan_year,
+        args=(scan_id, site, year, config),
+        daemon=True
+    )
+    thread.start()
+    return scan_id, config
+
+def get_or_create_site(base_url):
+    """Récupère ou crée un site dans la BD"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id FROM sites WHERE base_url = ?", (base_url,))
+        site = cursor.fetchone()
+        
+        if site:
+            return site['id']
+        
+        now = datetime.now().isoformat()
+        cursor.execute("""
+            INSERT INTO sites (base_url, created_at, updated_at, total_documents)
+            VALUES (?, ?, ?, 0)
+        """, (base_url, now, now))
+        
+        return cursor.lastrowid
+
+
+def save_harvest_parameters(site_id, params, scope='session'):
+    """Sauvegarde les paramètres de moissonnage"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        now = datetime.now().isoformat()
+        data_json = json.dumps(params)
+
+        cursor.execute("""
+            INSERT INTO harvest_parameters (site_id, created_at, data, scope)
+            VALUES (?, ?, ?, ?)
+        """, (site_id, now, data_json, scope))
+        params_id = cursor.lastrowid
+
+        if scope == 'site':
+            cursor.execute("""
+                UPDATE sites
+                SET current_parameters_id = ?, updated_at = ?
+                WHERE id = ?
+            """, (params_id, now, site_id))
+
+        return params_id
+
+
+def create_harvest_session(site_id, job_uuid, parameters_id=None):
+    """Crée une nouvelle session de moissonnage"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        now = datetime.now().isoformat()
+        
+        cursor.execute("""
+            INSERT INTO harvest_sessions 
+            (job_uuid, site_id, parameters_id, started_at, status, 
+             total_found, duplicates_removed, new_documents, total_documents)
+            VALUES (?, ?, ?, ?, 'running', 0, 0, 0, 0)
+        """, (job_uuid, site_id, parameters_id, now))
+        
+        return cursor.lastrowid
+
+
+def update_harvest_session(session_id, status, total_found=None, error_message=None):
+    """Met à jour une session de moissonnage"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        now = datetime.now().isoformat()
+        
+        if status == 'completed':
+            cursor.execute("""
+                UPDATE harvest_sessions
+                SET status = ?, completed_at = ?, total_found = ?
+                WHERE id = ?
+            """, (status, now, total_found or 0, session_id))
+        elif status == 'error':
+            cursor.execute("""
+                UPDATE harvest_sessions
+                SET status = ?, completed_at = ?, error_message = ?
+                WHERE id = ?
+            """, (status, now, error_message, session_id))
+        else:
+            cursor.execute("""
+                UPDATE harvest_sessions
+                SET status = ?
+                WHERE id = ?
+            """, (status, session_id))
+
+
+def insert_document(site_id, session_id, doc_data):
+    """
+    Insère un document dans la BD.
+    Retourne True si inséré, False si doublon.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        now = datetime.now().isoformat()
+        # Préparer extra_metadata
+        extra_metadata = {}
+        if 'number' in doc_data and doc_data['number'] is not None:
+            extra_metadata['number'] = doc_data['number']
+        if 'year' in doc_data and doc_data['year'] is not None:
+            extra_metadata['year'] = doc_data['year']
+        if doc_data.get('collection') is not None:
+            extra_metadata['collection'] = doc_data['collection']
+        if doc_data.get('document_date'):
+            extra_metadata['document_date'] = doc_data['document_date']
+        
+        extra_metadata_json = json.dumps(extra_metadata) if extra_metadata else None
+        
+        try:
+            cursor.execute("""
+                INSERT INTO documents 
+                (site_id, session_id, url, filename, title, file_type, 
+                 file_size, last_modified, accessible, added_at, extra_metadata,
+                 local_path, downloaded)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                site_id,
+                session_id,
+                doc_data['url'],
+                doc_data.get('filename'),
+                doc_data.get('title'),
+                doc_data.get('file_type'),
+                doc_data.get('file_size'),
+                doc_data.get('last_modified'),
+                doc_data.get('accessible', True),
+                now,
+                extra_metadata_json,
+                None,  # local_path - sera mis à jour après téléchargement
+                0      # downloaded - False par défaut
+            ))
+            
+            return True, cursor.lastrowid
+            
+        except sqlite3.IntegrityError:
+            # Doublon détecté
+            return False, None
+
+
+def update_document_local_path(doc_id, local_path):
+    """Met à jour le chemin local d'un document"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE documents
+            SET local_path = ?, downloaded = 1
+            WHERE id = ?
+        """, (local_path, doc_id))
+
+
+def update_session_statistics(session_id):
+    """Met à jour les statistiques de la session"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT COUNT(*) as count
+            FROM documents
+            WHERE session_id = ?
+        """, (session_id,))
+        
+        new_docs = cursor.fetchone()['count']
+        
+        cursor.execute("""
+            UPDATE harvest_sessions
+            SET new_documents = ?,
+                total_documents = (SELECT COUNT(*) FROM documents WHERE site_id = 
+                    (SELECT site_id FROM harvest_sessions WHERE id = ?))
+            WHERE id = ?
+        """, (new_docs, session_id, session_id))
+        
+        return new_docs
+
+
+def delete_empty_session(session_id):
+    """Supprime une session si elle n'a aucun nouveau document"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT new_documents FROM harvest_sessions WHERE id = ?
+        """, (session_id,))
+        
+        session = cursor.fetchone()
+        if session and session['new_documents'] == 0:
+            cursor.execute("DELETE FROM harvest_sessions WHERE id = ?", (session_id,))
+            return True
+        
+        return False
+
+
+def get_session_by_uuid(job_uuid):
+    """Récupère une session par son UUID"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT hs.*, s.base_url
+            FROM harvest_sessions hs
+            JOIN sites s ON hs.site_id = s.id
+            WHERE hs.job_uuid = ?
+        """, (job_uuid,))
+        
+        return cursor.fetchone()
+
+
+def get_session_documents(session_id):
+    """Récupère tous les documents d'une session"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM documents
+            WHERE session_id = ?
+            ORDER BY added_at
+        """, (session_id,))
+        
+        docs = cursor.fetchall()
+        
+        result = []
+        for doc in docs:
+            doc_dict = dict(doc)
+            if doc_dict['extra_metadata']:
+                extra = json.loads(doc_dict['extra_metadata'])
+                doc_dict.update(extra)
+            del doc_dict['extra_metadata']
+            result.append(doc_dict)
+        
+        return result
+
+
+def get_all_sessions():
+    """Récupère toutes les sessions de l'historique"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                hs.job_uuid as id,
+                hs.status,
+                hs.new_documents as document_count,
+                hs.started_at,
+                hs.completed_at,
+                s.base_url
+            FROM harvest_sessions hs
+            JOIN sites s ON hs.site_id = s.id
+            ORDER BY hs.started_at DESC
+        """)
+        
+        sessions = cursor.fetchall()
+        return [dict(session) for session in sessions]
+
+
+# ============================================================================
+# CLASSES DE MOISSONNAGE
+# ============================================================================
+
+class BaseHarvester(ABC):
+    DOCUMENT_EXTENSIONS = {
+        '.pdf', '.docx', '.doc', '.xlsx', '.xls',
+        '.pptx', '.ppt', '.png', '.jpg', '.jpeg',
+        '.gif', '.txt', '.csv', '.zip'
+    }
+    
+    def __init__(self, base_url, profile=None):
+        self.base_url = base_url
+        self.profile = profile or {}
+        self.documents = []
+    
+    @abstractmethod
+    def harvest(self, max_results=10):
+        pass
+    
+    def format_file_size(self, size_bytes):
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} TB"
+    
+    def get_document_info(self, url):
+        try:
+            response = requests.head(url, timeout=60, allow_redirects=True)
+            info = {}
+            
+            if response.status_code == 200:
+                if 'content-length' in response.headers:
+                    size_bytes = int(response.headers['content-length'])
+                    info['file_size'] = self.format_file_size(size_bytes)
+                
+                if 'last-modified' in response.headers:
+                    info['last_modified'] = response.headers['last-modified']
+                
+                path = urlparse(url).path
+                filename = unquote(path.split('/')[-1])
+                if filename:
+                    info['filename'] = filename
+                
+                info['accessible'] = True
+            else:
+                info['accessible'] = False
+            
+            return info
+        except:
+            return {'accessible': False}
+
+
+class GenericHarvester(BaseHarvester):
+    def matches_filters(self, metadata):
+        profile = self.profile
+        
+        if profile.get('extensions'):
+            ext = f".{metadata.get('file_type', '')}"
+            if ext not in profile['extensions']:
+                return False
+        
+        if profile.get('keywords'):
+            title = metadata.get('title', '').lower()
+            keywords = [k.strip().lower() for k in profile['keywords'].split(',')]
+            if not any(kw in title for kw in keywords if kw):
+                return False
+        
+        if profile.get('minSize') or profile.get('maxSize'):
+            size_str = metadata.get('file_size', '')
+            if size_str:
+                try:
+                    if 'KB' in size_str:
+                        size_kb = float(size_str.split()[0])
+                    elif 'MB' in size_str:
+                        size_kb = float(size_str.split()[0]) * 1024
+                    elif 'GB' in size_str:
+                        size_kb = float(size_str.split()[0]) * 1024 * 1024
+                    else:
+                        size_kb = 0
+                    
+                    if profile.get('minSize') and size_kb < float(profile['minSize']):
+                        return False
+                    if profile.get('maxSize') and size_kb > float(profile['maxSize']):
+                        return False
+                except:
+                    pass
+        
+        return True
+    
+    def harvest(self, max_results=10):
+        try:
+            response = requests.get(self.base_url, timeout=60)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            links = soup.find_all('a', href=True)
+            
+            for link in links:
+                if len(self.documents) >= max_results:
+                    break
+                
+                href = link['href']
+                full_url = urljoin(self.base_url, href)
+                path_lower = urlparse(full_url).path.lower()
+                
+                is_document = any(path_lower.endswith(ext) for ext in self.DOCUMENT_EXTENSIONS)
+                
+                if is_document:
+                    metadata = {
+                        'url': full_url,
+                        'title': link.get('title') or link.get_text(strip=True),
+                        'file_type': path_lower.split('.')[-1]
+                    }
+                    
+                    path = urlparse(full_url).path
+                    filename = unquote(path.split('/')[-1])
+                    if filename:
+                        metadata['filename'] = filename
+                    
+                    doc_info = self.get_document_info(full_url)
+                    metadata.update(doc_info)
+                    
+                    if self.matches_filters(metadata):
+                        self.documents.append(metadata)
+            
+            return self.documents
+        except Exception as e:
+            raise Exception(f"Erreur lors du moissonnage: {str(e)}")
+
+
+class JORADPHarvester(BaseHarvester):
+    def __init__(self, base_url, profile=None, year=2025, config=None, job_id=None):
+        super().__init__(base_url, profile)
+        self.year = year
+        self.job_id = job_id
+        self.config = config or {
+            'workers': 2,
+            'timeout': 60,
+            'retry_count': 3,
+            'delay_between': 0.5
+        }
+    
+    def build_pdf_urls(self, number):
+        """Retourne les deux variantes d'URL (majuscules et minuscules)"""
+        padded_number = str(number).zfill(3)
+        filename = f"F{self.year}{padded_number}.pdf"
+        
+        return [
+            f"https://www.joradp.dz/FTP/JO-FRANCAIS/{self.year}/{filename}",  # Majuscules
+            f"https://www.joradp.dz/FTP/jo-francais/{self.year}/{filename}"   # Minuscules
+        ]
+    
+    def check_pdf_exists(self, number):
+        """Vérifie l'existence du PDF en testant les deux variantes de casse"""
+        urls = self.build_pdf_urls(number)
+        
+        max_retries = self.config.get('retry_count', 3)
+        timeout = self.config.get('timeout', 60)
+        retry_delay = 2
+        
+        # Essayer chaque variante d'URL
+        for url in urls:
+            for attempt in range(max_retries):
+                try:
+                    response = requests.head(url, timeout=timeout, allow_redirects=True)
+                    if response.status_code == 200:
+                        metadata = {
+                            'url': url,
+                            'number': str(number).zfill(3),
+                            'title': f"Journal Officiel N°{str(number).zfill(3)} - {self.year}",
+                            'filename': f"F{self.year}{str(number).zfill(3)}.pdf",
+                            'year': self.year,
+                            'file_type': 'pdf',
+                            'accessible': True
+                        }
+                        
+                        if 'content-length' in response.headers:
+                            size_bytes = int(response.headers['content-length'])
+                            metadata['file_size'] = self.format_file_size(size_bytes)
+                        
+                        if 'last-modified' in response.headers:
+                            metadata['last_modified'] = response.headers['last-modified']
+                        
+                        return metadata
+                    elif response.status_code == 404:
+                        # 404 pour cette URL, essayer la suivante
+                        break
+                    else:
+                        # Autre erreur, réessayer
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                            continue
+                        break
+                        
+                except requests.exceptions.Timeout:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    break
+        
+        # Aucune des URLs n'a fonctionné
+        return None
+    
+    def harvest(self, max_results=10, start=1, end=100):
+        """Moissonne les documents avec support d'interruption"""
+        found_count = 0
+        workers = self.config.get('workers', 2)
+        delay = self.config.get('delay_between', 0.5)
+        
+        if workers == 1:
+            print(f"🔄 Mode séquentiel activé pour N°{start} à {end}")
+            for num in range(start, end + 1):
+                # Vérifier si interruption demandée
+                if self.job_id and active_jobs.get(self.job_id, {}).get('stop_requested'):
+                    print(f"⏹️ Moissonnage interrompu par l'utilisateur")
+                    break
+                
+                if max_results and found_count >= max_results:
+                    break
+                
+                result = self.check_pdf_exists(num)
+                if result:
+                    found_count += 1
+                    self.documents.append(result)
+                    print(f"✓ Trouvé: N°{result['number']}")
+                else:
+                    print(f"✗ Absent: N°{str(num).zfill(3)}")
+                
+                time.sleep(delay)
+        else:
+            print(f"⚡ Mode parallèle activé ({workers} workers)")
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_number = {
+                    executor.submit(self.check_pdf_exists, num): num
+                    for num in range(start, end + 1)
+                }
+                
+                for future in as_completed(future_to_number):
+                    # Vérifier si interruption demandée
+                    if self.job_id and active_jobs.get(self.job_id, {}).get('stop_requested'):
+                        print(f"⏹️ Moissonnage interrompu par l'utilisateur")
+                        # Annuler les tâches restantes
+                        for f in future_to_number:
+                            f.cancel()
+                        break
+                    
+                    result = future.result()
+                    if result:
+                        found_count += 1
+                        self.documents.append(result)
+                        
+                        if max_results and found_count >= max_results:
+                            for f in future_to_number:
+                                f.cancel()
+                            break
+                    
+                    time.sleep(delay)
+        
+        self.documents.sort(key=lambda x: x['number'])
+        return self.documents
+
+
+# ============================================================================
+# API FLASK
+# ============================================================================
+
+from analysis_routes import register_analysis_routes
+app = Flask(__name__)
+app.config['JSON_AS_ASCII'] = False  # Supporter les caractères français
+register_analysis_routes(app)
+CORS(app)
+
+active_jobs = {}
+document_jobs = {}
+DOCUMENT_PHASES = {'collect', 'download', 'analyze'}
+
+
+@app.route('/api/harvesters', methods=['GET'])
+def get_harvesters():
+    return jsonify({
+        'harvesters': [
+            {
+                'id': 'generic',
+                'name': 'Moissonneur Générique',
+                'description': 'Pour sites HTML standard avec liens directs',
+                'params': ['url', 'max_results', 'extensions']
+            },
+            {
+                'id': 'joradp',
+                'name': 'JORADP (Journal Officiel Algérie)',
+                'description': 'Moissonneur spécialisé pour le JORADP',
+                'params': ['year', 'start', 'end', 'max_results']
+            },
+            {
+                'id': 'selenium',
+                'name': 'Moissonneur JavaScript',
+                'description': 'Pour sites avec JavaScript (nécessite Selenium)',
+                'params': ['url', 'max_results', 'wait_time'],
+                'available': SELENIUM_AVAILABLE
+            }
+        ]
+    })
+
+
+@app.route('/api/harvest', methods=['POST'])
+def start_harvest():
+    data = request.json
+    
+    harvester_type = data.get('harvester_type', 'generic')
+    url = data.get('url')
+    
+    if not url and harvester_type != 'joradp':
+        return jsonify({'error': 'URL requise'}), 400
+    
+    # Déterminer l'URL de base
+    if harvester_type == 'joradp':
+        base_url = "https://www.joradp.dz/HFR/Index.htm"
+    else:
+        base_url = url
+    
+    # Créer ou récupérer le site
+    site_id = get_or_create_site(base_url)
+    
+    # Sauvegarder les paramètres
+    parameters_id = save_harvest_parameters(site_id, data, scope='session')
+    site_parameters_payload = data.copy()
+    site_parameters_payload.pop('resume', None)
+    save_harvest_parameters(site_id, site_parameters_payload, scope='site')
+
+    # Déterminer les tâches demandées (collect, download, analyze)
+    allowed_tasks = ['collect', 'download', 'analyze']
+    requested_tasks = data.get('tasks')
+    tasks = []
+    if isinstance(requested_tasks, list):
+        for task in requested_tasks:
+            if task in allowed_tasks and task not in tasks:
+                tasks.append(task)
+    if not tasks:
+        tasks = allowed_tasks.copy()
+    if 'collect' not in tasks:
+        tasks.insert(0, 'collect')
+    if 'analyze' in tasks and 'download' not in tasks:
+        insert_pos = tasks.index('analyze')
+        tasks.insert(insert_pos, 'download')
+    data['tasks'] = tasks
+    
+    # Créer le job
+    job_uuid = str(uuid.uuid4())
+    session_id = create_harvest_session(site_id, job_uuid, parameters_id)
+    
+    # Stocker temporairement
+    phases_template = {
+        'collect': {'status': 'pending', 'processed': 0, 'total': 0},
+        'download': {'status': 'pending', 'processed': 0, 'total': 0},
+        'analyze': {'status': 'pending', 'processed': 0, 'total': 0},
+    }
+    for phase in phases_template.keys():
+        if phase not in tasks:
+            phases_template[phase]['status'] = 'skipped'
+        else:
+            phases_template[phase]['status'] = 'pending'
+    ordered_phases = [phase for phase in tasks if phases_template.get(phase, {}).get('status') != 'skipped']
+    if ordered_phases:
+        first_phase = ordered_phases[0]
+        phases_template[first_phase]['status'] = 'running'
+        for phase in ordered_phases[1:]:
+            phases_template[phase]['status'] = 'queued'
+    active_jobs[job_uuid] = {
+        'session_id': session_id,
+        'site_id': site_id,
+        'status': 'running',
+        'progress': 0,
+        'tasks': tasks,
+        'phases': phases_template,
+    }
+    
+    # Lancer le moissonnage dans un thread
+    thread = threading.Thread(
+        target=run_harvest,
+        args=(job_uuid, session_id, site_id, harvester_type, data)
+    )
+    thread.start()
+    
+    return jsonify({
+        'job_id': job_uuid,
+        'status': 'started'
+    })
+
+
+def run_harvest(job_uuid, session_id, site_id, harvester_type, params):
+    try:
+        tasks = params.get('tasks') or ['collect', 'download', 'analyze']
+        job_meta = active_jobs.get(job_uuid, {})
+        phases = job_meta.get('phases', {
+            'collect': {'status': 'pending', 'processed': 0, 'total': 0},
+            'download': {'status': 'pending', 'processed': 0, 'total': 0},
+            'analyze': {'status': 'pending', 'processed': 0, 'total': 0},
+        })
+        collection_label = params.get('collection_name') or params.get('collection')
+        start_time = datetime.now().isoformat()
+
+        def sync_active_job(phases_snapshot=None, **extra):
+            if job_uuid not in active_jobs:
+                return
+            source = phases_snapshot if phases_snapshot is not None else phases
+            snapshot = copy.deepcopy(source)
+            active_jobs[job_uuid]['phases'] = snapshot
+            if extra:
+                active_jobs[job_uuid].update(extra)
+
+        # Initialiser la première phase comme active
+        if phases.get('collect') and phases['collect'].get('status') not in ['skipped', 'running']:
+            phases['collect']['status'] = 'running'
+        sync_active_job()
+
+        # Créer le harvester
+        if harvester_type == 'joradp':
+            # Nouveau mapping des champs
+            # collection_name contient l'année pour JORADP
+            year_value = params.get('collection_name') or params.get('year') or str(datetime.now().year)
+            year = int(year_value) if str(year_value).isdigit() else datetime.now().year
+            
+            # Nouveaux noms de champs
+            start = int(params.get('start_number') or params.get('start') or 1)
+            end = int(params.get('end_number') or params.get('end') or 100)
+            
+            # max_results peut être vide (= tout)
+            max_results_value = params.get('max_results')
+            max_results = int(max_results_value) if max_results_value else None
+            
+            config = {
+                'workers': int(params.get('workers', 2)),
+                'timeout': int(params.get('timeout', 60)),
+                'retry_count': int(params.get('retry_count', 3)),
+                'delay_between': float(params.get('delay_between', 0.5))
+            }
+            
+            print(f"🔍 JORADP Config: year={year}, start={start}, end={end}, max_results={max_results}")
+            
+            harvester = JORADPHarvester(
+                base_url="https://www.joradp.dz/HFR/Index.htm",
+                year=year,
+                config=config,
+                job_id=job_uuid
+            )
+            documents = harvester.harvest(max_results=max_results, start=start, end=end)
+        
+        elif harvester_type == 'generic':
+            url = params.get('url')
+            max_results = int(params.get('max_results', 10))
+            
+            profile = {}
+            if params.get('extensions'):
+                profile['extensions'] = params['extensions']
+            if params.get('keywords'):
+                profile['keywords'] = params['keywords']
+            if params.get('minSize'):
+                profile['minSize'] = params['minSize']
+            if params.get('maxSize'):
+                profile['maxSize'] = params['maxSize']
+            
+            harvester = GenericHarvester(url, profile=profile)
+            documents = harvester.harvest(max_results=max_results)
+        
+        else:
+            raise ValueError(f"Type de moissonneur non supporté: {harvester_type}")
+        
+        # Insérer les documents dans la BD
+        duplicates_count = 0
+        inserted_docs = []
+        
+        phases['collect']['status'] = 'running'
+        phases['collect']['processed'] = 0
+        phases['collect']['total'] = len(documents)
+        sync_active_job()
+
+        for doc in documents:
+            if collection_label and 'collection' not in doc:
+                doc['collection'] = collection_label
+            if 'document_date' not in doc and params.get('date_start'):
+                doc['document_date'] = params.get('date_start')
+            inserted, doc_id = insert_document(site_id, session_id, doc)
+            if inserted:
+                inserted_docs.append((doc_id, doc))
+                phases['collect']['processed'] += 1
+                sync_active_job()
+            else:
+                duplicates_count += 1
+        
+        print(f"\n📊 Statistiques d'insertion:")
+        print(f"   • Documents trouvés : {len(documents)}")
+        print(f"   • Nouveaux documents : {len(inserted_docs)}")
+        print(f"   • Doublons ignorés : {duplicates_count}")
+
+        phases['collect']['status'] = 'completed'
+        sync_active_job()
+        
+        # Télécharger les fichiers pour les nouveaux documents si demandé
+        if inserted_docs and any(task in tasks for task in ['download', 'analyze']):
+            phases['download']['status'] = 'running'
+            phases['download']['processed'] = 0
+            phases['download']['total'] = len(inserted_docs)
+            print(f"\n📥 Téléchargement des fichiers...")
+            sync_active_job()
+            
+            # Déterminer le chemin de stockage
+            base_url = harvester.base_url
+            site_name = params.get('site_name')
+            subfolder = params.get('subfolder') or params.get('year')
+            
+            storage_path = get_storage_path(base_url, site_name, subfolder)
+            print(f"   📁 Répertoire de stockage : {storage_path}")
+            
+            # Télécharger chaque document
+            download_errors = 0
+            for doc_id, doc in inserted_docs:
+                success, local_path, error = download_document(
+                    doc['url'], 
+                    storage_path,
+                    timeout=int(params.get('timeout', 60))
+                )
+                
+                if success:
+                    # Mettre à jour le chemin local dans la BD
+                    update_document_local_path(doc_id, local_path)
+                    phases['download']['processed'] += 1
+                    sync_active_job()
+                    if 'analyze' in tasks:
+                        with get_db_connection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "UPDATE documents SET analysis_status = ? WHERE id = ?",
+                                ('pending', doc_id),
+                            )
+                else:
+                    download_errors += 1
+                    print(f"   ⚠️  Échec téléchargement : {doc['url']}")
+            phases['download']['status'] = 'completed' if download_errors == 0 else 'partial'
+            sync_active_job()
+            
+            print(f"\n✅ Téléchargement terminé :")
+            print(f"   • Fichiers téléchargés : {len(inserted_docs) - download_errors}")
+            print(f"   • Erreurs : {download_errors}")
+        else:
+            if 'download' not in tasks and phases.get('download'):
+                phases['download']['status'] = 'skipped'
+            elif not inserted_docs:
+                phases['download']['status'] = 'skipped'
+            else:
+                phases['download']['status'] = phases.get('download', {}).get('status', 'pending')
+            sync_active_job()
+
+        if 'analyze' in tasks:
+            if phases['analyze']['status'] != 'skipped':
+                phases['analyze']['status'] = 'queued'
+                phases['analyze']['total'] = len(inserted_docs)
+                phases['analyze']['processed'] = 0
+                sync_active_job()
+        else:
+            phases['analyze']['status'] = 'skipped'
+            sync_active_job()
+        
+        # Mettre à jour les statistiques
+        new_docs_count = update_session_statistics(session_id)
+        
+        # Mettre à jour le compteur de doublons
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE harvest_sessions
+                SET duplicates_removed = ?
+                WHERE id = ?
+            """, (duplicates_count, session_id))
+        
+        # Marquer comme terminé
+        update_harvest_session(session_id, 'completed', len(documents))
+        
+        # Supprimer la session si vide
+        was_deleted = delete_empty_session(session_id)
+        
+        job_meta['completed_at'] = datetime.now().isoformat()
+        phases['collect']['completed_at'] = job_meta['completed_at']
+        if phases.get('download'):
+            phases['download']['completed_at'] = job_meta['completed_at']
+        if phases.get('analyze') and phases['analyze']['status'] == 'queued':
+            phases['analyze']['queued_at'] = job_meta['completed_at']
+
+        # Mettre à jour le job actif
+        if job_uuid in active_jobs:
+            active_jobs[job_uuid]['status'] = 'deleted' if was_deleted else 'completed'
+            active_jobs[job_uuid]['progress'] = 100
+            active_jobs[job_uuid]['new_documents'] = new_docs_count
+            active_jobs[job_uuid]['duplicates'] = duplicates_count
+            active_jobs[job_uuid]['phases'] = phases
+            active_jobs[job_uuid]['started_at'] = start_time
+            active_jobs[job_uuid]['completed_at'] = job_meta.get('completed_at')
+        sync_active_job()
+        
+        print(f"\n🎉 Moissonnage terminé : {new_docs_count} nouveaux docs, {duplicates_count} doublons")
+        
+    except Exception as e:
+        print(f"\n❌ Erreur : {str(e)}")
+        update_harvest_session(session_id, 'error', error_message=str(e))
+        
+        if job_uuid in active_jobs:
+            active_jobs[job_uuid]['status'] = 'error'
+            active_jobs[job_uuid]['error'] = str(e)
+            active_jobs[job_uuid]['phases'] = phases
+
+
+@app.route('/api/harvest/<job_id>', methods=['GET'])
+def get_harvest_status(job_id):
+    if job_id in active_jobs:
+        job = active_jobs[job_id]
+        
+        if job['status'] in ['completed', 'deleted']:
+            session = get_session_by_uuid(job_id)
+            if session:
+                documents = get_session_documents(session['id'])
+                return jsonify({
+                    'id': job_id,
+                    'status': job['status'],
+                    'documents': documents,
+                    'document_count': len(documents),
+                    'started_at': session['started_at'],
+                    'completed_at': session['completed_at'],
+                    'tasks': job.get('tasks'),
+                    'phases': job.get('phases'),
+                    'site_id': job.get('site_id'),
+                })
+            return jsonify({
+                'id': job_id,
+                'status': 'deleted',
+                'message': 'Session supprimée (tous les documents étaient des doublons)',
+                'documents': [],
+                'document_count': 0,
+                'tasks': job.get('tasks'),
+                'phases': job.get('phases'),
+                'site_id': job.get('site_id'),
+            })
+        
+        return jsonify({
+            'id': job_id,
+            'status': job['status'],
+            'progress': job['progress'],
+            'tasks': job.get('tasks'),
+            'phases': job.get('phases'),
+            'started_at': job.get('started_at'),
+            'site_id': job.get('site_id'),
+        })
+    
+    session = get_session_by_uuid(job_id)
+    if not session:
+        return jsonify({'error': 'Job introuvable'}), 404
+    
+    return jsonify({
+        'id': job_id,
+        'status': session['status'],
+        'started_at': session['started_at'],
+        'completed_at': session['completed_at']
+    })
+
+
+@app.route('/api/harvest/<job_id>/results', methods=['GET'])
+def get_harvest_results(job_id):
+    session = get_session_by_uuid(job_id)
+    
+    if not session:
+        return jsonify({'error': 'Job introuvable'}), 404
+    
+    if session['status'] != 'completed':
+        return jsonify({'error': 'Moissonnage non terminé'}), 400
+    
+    documents = get_session_documents(session['id'])
+    
+    return jsonify({
+        'job_id': job_id,
+        'document_count': len(documents),
+        'documents': documents,
+        'started_at': session['started_at'],
+        'completed_at': session['completed_at']
+    })
+
+
+@app.route('/api/harvest/<job_id>/export', methods=['GET'])
+def export_harvest_results(job_id):
+    session = get_session_by_uuid(job_id)
+    
+    if not session:
+        return jsonify({'error': 'Job introuvable'}), 404
+    
+    # Récupérer le paramètre include_analysis
+    include_analysis = request.args.get('include_analysis', 'false').lower() == 'true'
+    
+    documents = get_session_documents(session['id'])
+    
+    # Enrichir avec les analyses si demandé
+    if include_analysis:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            for doc in documents:
+                cursor.execute("""
+                    SELECT analyzed, analysis_status, ai_analysis, full_text_path
+                    FROM documents 
+                    WHERE id = ?
+                """, (doc['id'],))
+                
+                analysis_data = cursor.fetchone()
+                if analysis_data:
+                    doc['analysis'] = {
+                        'analyzed': bool(analysis_data[0]),
+                        'status': analysis_data[1],
+                        'full_text_available': bool(analysis_data[3])
+                    }
+                    
+                    # Parser le JSON ai_analysis s'il existe
+                    if analysis_data[2]:
+                        try:
+                            doc['analysis']['result'] = json.loads(analysis_data[2])
+                        except json.JSONDecodeError:
+                            doc['analysis']['result'] = None
+    
+    result = {
+        'job_id': job_id,
+        'export_date': datetime.now().isoformat(),
+        'document_count': len(documents),
+        'documents': documents,
+        'include_analysis': include_analysis,
+        'statistics': {
+            'total_found': session['total_found'],
+            'duplicates_removed': session['duplicates_removed'],
+            'new_documents': session['new_documents']
+        }
+    }
+    
+    # Forcer UTF-8 dans la réponse JSON
+    response = app.response_class(
+        response=json.dumps(result, ensure_ascii=False, indent=2),
+        status=200,
+        mimetype='application/json; charset=utf-8'
+    )
+    return response
+
+
+@app.route('/api/jobs', methods=['GET'])
+def get_all_jobs():
+    sessions = get_all_sessions()
+    return jsonify({'jobs': sessions})
+
+
+@app.route('/api/jobs/<job_id>', methods=['DELETE'])
+def delete_job(job_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id FROM harvest_sessions WHERE job_uuid = ?", (job_id,))
+        session = cursor.fetchone()
+        
+        if not session:
+            return jsonify({'error': 'Job introuvable'}), 404
+        
+        session_id = session['id']
+        
+        # Récupérer les chemins locaux avant suppression
+        cursor.execute("SELECT local_path FROM documents WHERE session_id = ?", (session_id,))
+        docs = cursor.fetchall()
+        
+        # Supprimer les fichiers physiques
+        for doc in docs:
+            if doc['local_path']:
+                delete_local_file(doc['local_path'])
+        
+        # Supprimer les documents de la BD
+        cursor.execute("DELETE FROM documents WHERE session_id = ?", (session_id,))
+        
+        # Supprimer la session
+        cursor.execute("DELETE FROM harvest_sessions WHERE id = ?", (session_id,))
+    
+    return jsonify({'success': True, 'message': 'Job et fichiers supprimés définitivement'})
+
+
+@app.route('/api/jobs/bulk-delete', methods=['POST'])
+def bulk_delete_jobs():
+    job_ids = request.json.get('job_ids', [])
+    
+    deleted_count = 0
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        for job_id in job_ids:
+            cursor.execute("SELECT id FROM harvest_sessions WHERE job_uuid = ?", (job_id,))
+            session = cursor.fetchone()
+            
+            if session:
+                session_id = session['id']
+                
+                # Supprimer les fichiers physiques
+                cursor.execute("SELECT local_path FROM documents WHERE session_id = ?", (session_id,))
+                docs = cursor.fetchall()
+                for doc in docs:
+                    if doc['local_path']:
+                        delete_local_file(doc['local_path'])
+                
+                # Supprimer de la BD
+                cursor.execute("DELETE FROM documents WHERE session_id = ?", (session_id,))
+                cursor.execute("DELETE FROM harvest_sessions WHERE id = ?", (session_id,))
+                deleted_count += 1
+    
+    return jsonify({
+        'success': True,
+        'deleted_count': deleted_count,
+        'message': f'{deleted_count} job(s) et fichiers supprimés définitivement'
+    })
+
+
+@app.route('/api/duplicates', methods=['POST'])
+def detect_duplicates():
+    job_ids = request.json.get('job_ids', [])
+    
+    if not job_ids:
+        return jsonify({'duplicates': []})
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        placeholders = ','.join('?' * len(job_ids))
+        cursor.execute(f"""
+            SELECT d.*, hs.job_uuid, hs.started_at as session_date
+            FROM documents d
+            JOIN harvest_sessions hs ON d.session_id = hs.id
+            WHERE hs.job_uuid IN ({placeholders})
+            ORDER BY d.added_at
+        """, job_ids)
+        
+        all_docs = cursor.fetchall()
+        
+        url_map = {}
+        duplicates = []
+        
+        for doc in all_docs:
+            doc_dict = dict(doc)
+            url = doc_dict['url']
+            
+            if url in url_map:
+                original = url_map[url]
+                duplicates.append({
+                    'url': url,
+                    'original': {
+                        'job_id': original['job_uuid'],
+                        'doc_index': 0,
+                        'title': original['title'],
+                        'filename': original['filename'],
+                        'created_at': original['session_date']
+                    },
+                    'duplicate': {
+                        'job_id': doc_dict['job_uuid'],
+                        'doc_index': 0,
+                        'title': doc_dict['title'],
+                        'filename': doc_dict['filename'],
+                        'created_at': doc_dict['session_date']
+                    }
+                })
+            else:
+                url_map[url] = doc_dict
+    
+    return jsonify({
+        'duplicate_count': len(duplicates),
+        'duplicates': duplicates
+    })
+
+
+@app.route('/api/harvest/<job_id>/document/<int:doc_index>/delete', methods=['POST'])
+def delete_document(job_id, doc_index):
+    session = get_session_by_uuid(job_id)
+    
+    if not session:
+        return jsonify({'error': 'Job introuvable'}), 404
+    
+    documents = get_session_documents(session['id'])
+    
+    if doc_index < 0 or doc_index >= len(documents):
+        return jsonify({'error': 'Index invalide'}), 400
+    
+    doc = documents[doc_index]
+    doc_id = doc['id']
+    local_path = doc.get('local_path')
+    
+    # Supprimer le fichier physique
+    if local_path:
+        delete_local_file(local_path)
+    
+    # Supprimer de la BD
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    
+    # Mettre à jour les statistiques
+    new_docs_count = update_session_statistics(session['id'])
+    
+    # Vérifier si la session est vide
+    was_deleted = delete_empty_session(session['id'])
+    
+    if was_deleted:
+        return jsonify({
+            'success': True,
+            'message': 'Document et fichier supprimés',
+            'job_deleted': True,
+            'info': 'Le moissonnage a été supprimé car tous ses documents sont supprimés'
+        })
+    
+    return jsonify({
+        'success': True,
+        'message': 'Document et fichier supprimés',
+        'job_deleted': False,
+        'remaining_documents': new_docs_count
+    })
+
+
+@app.route('/api/harvest/<job_id>/document/<int:doc_index>/rename', methods=['POST'])
+def rename_document(job_id, doc_index):
+    session = get_session_by_uuid(job_id)
+    
+    if not session:
+        return jsonify({'error': 'Job introuvable'}), 404
+    
+
+@app.route('/api/harvest/<job_id>/stop', methods=['POST'])
+def stop_harvest(job_id):
+    """Arrête un moissonnage en cours"""
+    if job_id not in active_jobs:
+        return jsonify({'error': 'Job non trouvé'}), 404
+    
+    job = active_jobs[job_id]
+    
+    if job['status'] != 'running':
+        return jsonify({'error': 'Le job n\'est pas en cours'}), 400
+    
+    # Marquer le job comme devant être arrêté
+    active_jobs[job_id]['stop_requested'] = True
+    
+    print(f"⏹️ Demande d'arrêt du job {job_id}")
+    
+    return jsonify({
+        'message': 'Demande d\'arrêt envoyée',
+        'job_id': job_id
+    })
+
+    documents = get_session_documents(session['id'])
+    
+    if doc_index < 0 or doc_index >= len(documents):
+        return jsonify({'error': 'Index invalide'}), 400
+    
+    doc_id = documents[doc_index]['id']
+    new_filename = request.json.get('filename')
+    
+    if not new_filename:
+        return jsonify({'error': 'Nom de fichier requis'}), 400
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE documents
+            SET filename = ?
+            WHERE id = ?
+        """, (new_filename, doc_id))
+    
+    return jsonify({'success': True, 'message': 'Document renommé'})
+
+
+
+@app.route('/api/joradp/year-info/<int:year>', methods=['GET'])
+def get_joradp_year_info(year):
+    """Obtient le nombre min/max de journaux pour une année JORADP donnée"""
+    try:
+        print(f"🔍 Recherche du max pour l'année {year}...")
+        
+        # Tester d'abord si le N°1 existe
+        test_url = f"https://www.joradp.dz/FTP/JO-FRANCAIS/{year}/F{year}001.pdf"
+        try:
+            response = requests.head(test_url, timeout=5, allow_redirects=True)
+            if response.status_code != 200:
+                # Essayer avec minuscules
+                test_url = f"https://www.joradp.dz/FTP/jo-francais/{year}/F{year}001.pdf"
+                response = requests.head(test_url, timeout=5, allow_redirects=True)
+                if response.status_code != 200:
+                    return jsonify({'error': f'Aucun journal trouvé pour l\'année {year}'}), 404
+        except:
+            return jsonify({'error': f'Impossible de vérifier l\'année {year}'}), 500
+        
+        # Le N°1 existe, maintenant trouvons le max par recherche binaire
+        def check_number_exists(num):
+            """Vérifie si un numéro existe"""
+            padded = str(num).zfill(3)
+            urls = [
+                f"https://www.joradp.dz/FTP/JO-FRANCAIS/{year}/F{year}{padded}.pdf",
+                f"https://www.joradp.dz/FTP/jo-francais/{year}/F{year}{padded}.pdf"
+            ]
+            for url in urls:
+                try:
+                    r = requests.head(url, timeout=3, allow_redirects=True)
+                    if r.status_code == 200:
+                        return True
+                except:
+                    continue
+            return False
+        
+        # Recherche binaire pour trouver le dernier numéro
+        left, right = 1, 200
+        last_found = 1
+        
+        while left <= right:
+            mid = (left + right) // 2
+            if check_number_exists(mid):
+                last_found = mid
+                left = mid + 1
+            else:
+                right = mid - 1
+        
+        print(f"✅ Année {year} : N°1 à N°{last_found}")
+        
+        return jsonify({
+            'year': year,
+            'min': 1,
+            'max': last_found,
+            'total': last_found,
+            'message': f'Journaux disponibles : N°1 à N°{last_found}'
+        })
+        
+    except Exception as e:
+        print(f"❌ Erreur : {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/sites', methods=['GET'])
+def list_sites():
+    """Retourne la liste des sites configurés."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                s.id,
+                s.base_url,
+                s.created_at,
+                s.updated_at,
+                s.last_harvest_at,
+                s.total_documents,
+                s.current_parameters_id,
+                (
+                    SELECT COUNT(*)
+                    FROM documents d
+                    WHERE d.site_id = s.id
+                ) AS indexed_documents
+            FROM sites s
+            ORDER BY s.id
+            """
+        )
+        sites = []
+        site_rows = cursor.fetchall()
+        now = datetime.utcnow()
+        for row in site_rows:
+            item = dict(row)
+            stats_cursor = conn.cursor()
+            stats_cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN downloaded = 1 THEN 1 ELSE 0 END), 0) AS downloaded,
+                    COALESCE(SUM(CASE WHEN downloaded = 0 THEN 1 ELSE 0 END), 0) AS download_pending,
+                    COALESCE(SUM(CASE WHEN analysis_status = 'completed' THEN 1 ELSE 0 END), 0) AS analyzed,
+                    COALESCE(SUM(CASE WHEN analysis_status = 'error' THEN 1 ELSE 0 END), 0) AS analyze_errors,
+                    COALESCE(SUM(CASE WHEN analysis_status IS NULL OR analysis_status IN ('', 'pending') THEN 1 ELSE 0 END), 0) AS analyze_pending
+                FROM documents
+                WHERE site_id = ?
+                """,
+                (item['id'],),
+            )
+            stats = stats_cursor.fetchone() or {
+                'total': 0,
+                'downloaded': 0,
+                'download_pending': 0,
+                'analyzed': 0,
+                'analyze_errors': 0,
+                'analyze_pending': 0,
+            }
+            stats_cursor.execute(
+                """
+                SELECT DISTINCT
+                    COALESCE(json_extract(extra_metadata, '$.collection'), '') AS collection
+                FROM documents
+                WHERE site_id = ?
+                  AND json_extract(extra_metadata, '$.collection') IS NOT NULL
+                  AND json_extract(extra_metadata, '$.collection') != ''
+                """,
+                (item['id'],),
+            )
+            collections = [
+                row_collection['collection']
+                for row_collection in stats_cursor.fetchall()
+                if row_collection['collection']
+            ]
+            stats_cursor.execute(
+                """
+                SELECT job_uuid, status, started_at, completed_at, total_found
+                FROM harvest_sessions
+                WHERE site_id = ?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (item['id'],),
+            )
+            last_job = stats_cursor.fetchone()
+            params_row = None
+            if item.get('current_parameters_id'):
+                stats_cursor.execute(
+                    """
+                    SELECT data
+                    FROM harvest_parameters
+                    WHERE id = ?
+                    LIMIT 1
+                    """
+                    ,
+                    (item['current_parameters_id'],),
+                )
+                params_row = stats_cursor.fetchone()
+            if not params_row:
+                stats_cursor.execute(
+                    """
+                    SELECT data
+                    FROM harvest_parameters
+                    WHERE site_id = ?
+                      AND scope = 'site'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                    ,
+                    (item['id'],),
+                )
+                params_row = stats_cursor.fetchone()
+            params = {}
+            if params_row and params_row['data']:
+                try:
+                    params = json.loads(params_row['data'])
+                except json.JSONDecodeError:
+                    params = {}
+            collect_freq = params.get('schedule_collect') or 'manual'
+            download_freq = params.get('schedule_download') or 'manual'
+            analyze_freq = params.get('schedule_analyze') or 'manual'
+            last_completed_dt = None
+            if last_job:
+                last_completed_dt = parse_timestamp(last_job.get('completed_at'))
+                if not last_completed_dt:
+                    last_completed_dt = parse_timestamp(last_job.get('started_at'))
+            if not last_completed_dt:
+                last_completed_dt = parse_timestamp(item.get('last_harvest_at'))
+            if not last_completed_dt:
+                last_completed_dt = parse_timestamp(item.get('updated_at'))
+            schedule_data = {
+                'collect': {
+                    'frequency': collect_freq,
+                    'next_run_at': compute_next_run_at(collect_freq, last_completed_dt, now),
+                },
+                'download': {
+                    'frequency': download_freq,
+                    'next_run_at': compute_next_run_at(download_freq, last_completed_dt, now),
+                },
+                'analyze': {
+                    'frequency': analyze_freq,
+                    'next_run_at': compute_next_run_at(analyze_freq, last_completed_dt, now),
+                },
+            }
+            item['current_parameters'] = params if params else None
+            item['stats'] = {
+                'total': stats['total'],
+                'downloaded': stats['downloaded'],
+                'download_pending': stats['download_pending'],
+                'analyzed': stats['analyzed'],
+                'analyze_pending': stats['analyze_pending'],
+                'analyze_errors': stats['analyze_errors'],
+            }
+            item['collections'] = collections
+            if last_job:
+                item['last_job'] = dict(last_job)
+            else:
+                item['last_job'] = None
+            item['schedule'] = schedule_data
+            item['next_harvest_at'] = schedule_data['collect']['next_run_at']
+            sites.append(item)
+    return jsonify({'sites': sites})
+
+
+@app.route('/api/sites/<int:site_id>/documents', methods=['GET'])
+def list_site_documents(site_id):
+    """Retourne les documents d'un site avec pagination et filtres."""
+    page = max(int(request.args.get('page', 1)), 1)
+    page_size = min(max(int(request.args.get('page_size', 25)), 1), 200)
+    offset = (page - 1) * page_size
+    search = request.args.get('search')
+    collection_filter = request.args.get('collection')
+    status_filter = request.args.get('status')
+    phase_filter = request.args.get('phase')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+
+    where_clauses = ["site_id = ?"]
+    params = [site_id]
+
+    if search:
+        where_clauses.append("(title LIKE ? OR filename LIKE ? OR url LIKE ?)")
+        like_value = f"%{search}%"
+        params.extend([like_value, like_value, like_value])
+
+    if collection_filter:
+        where_clauses.append("json_extract(extra_metadata, '$.collection') = ?")
+        params.append(collection_filter)
+
+    if status_filter == 'downloaded':
+        where_clauses.append("downloaded = 1")
+    elif status_filter == 'download_pending':
+        where_clauses.append("downloaded = 0")
+    elif status_filter == 'analysis_completed':
+        where_clauses.append("analysis_status = 'completed'")
+    elif status_filter == 'analysis_error':
+        where_clauses.append("analysis_status = 'error'")
+    elif status_filter == 'analysis_pending':
+        where_clauses.append("(analysis_status IS NULL OR analysis_status = '' OR analysis_status = 'pending')")
+
+    if phase_filter == 'collect_error':
+        where_clauses.append("accessible = 0")
+    elif phase_filter == 'collect_success':
+        where_clauses.append("accessible = 1")
+
+    if start_date:
+        where_clauses.append("added_at >= ?")
+        params.append(start_date)
+    if end_date:
+        where_clauses.append("added_at <= ?")
+        params.append(end_date)
+
+    where_sql = " AND ".join(where_clauses)
+
+    ensure_archive_tables()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            f"SELECT COUNT(*) AS total FROM documents WHERE {where_sql}",
+            tuple(params),
+        )
+        total = cursor.fetchone()['total']
+
+        cursor.execute(
+            f"""
+            SELECT
+                id,
+                url,
+                filename,
+                title,
+                file_type,
+                file_size,
+                last_modified,
+                accessible,
+                added_at,
+                local_path,
+                downloaded,
+                analyzed,
+                analysis_status,
+                ai_analysis,
+                extra_metadata
+            FROM documents
+            WHERE {where_sql}
+            ORDER BY added_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [page_size, offset]),
+        )
+        items = []
+        for row in cursor.fetchall():
+            record = dict(row)
+            metadata = {}
+            analysis_payload = None
+            if record.get('extra_metadata'):
+                try:
+                    metadata = json.loads(record['extra_metadata'])
+                except json.JSONDecodeError:
+                    metadata = {}
+            if record.get('ai_analysis'):
+                try:
+                    analysis_payload = json.loads(record['ai_analysis'])
+                except json.JSONDecodeError:
+                    analysis_payload = record['ai_analysis']
+            collect_status = 'success' if record.get('accessible') else 'error'
+            download_status = 'success' if record.get('downloaded') else 'pending'
+            if record.get('downloaded') == 0 and record.get('local_path') and not os.path.exists(record['local_path']):
+                download_status = 'error'
+
+            analyze_raw_status = (record.get('analysis_status') or '').lower()
+            if analyze_raw_status == 'completed':
+                analyze_status = 'success'
+            elif analyze_raw_status == 'error':
+                analyze_status = 'error'
+            elif analyze_raw_status in ['processing', 'running']:
+                analyze_status = 'running'
+            elif analyze_raw_status in ['stopped', 'cancelled']:
+                analyze_status = analyze_raw_status
+            else:
+                analyze_status = 'pending'
+            phases = {
+                'collect': collect_status,
+                'download': download_status,
+                'analyze': analyze_status,
+            }
+            items.append({
+                'id': record['id'],
+                'url': record['url'],
+                'filename': record['filename'],
+                'title': record['title'],
+                'file_type': record['file_type'],
+                'file_size': record['file_size'],
+                'last_modified': record['last_modified'],
+                'added_at': record['added_at'],
+                'local_path': record['local_path'],
+                'metadata': metadata,
+                'collection': metadata.get('collection'),
+                'number': metadata.get('number'),
+                'year': metadata.get('year'),
+                'document_date': metadata.get('document_date'),
+                'phases': phases,
+                'analysis_status': record.get('analysis_status'),
+                'analysis': analysis_payload,
+                'full_text_path': record.get('full_text_path'),
+            })
+
+        cursor.execute(
+            """
+            SELECT DISTINCT
+                COALESCE(json_extract(extra_metadata, '$.collection'), '') AS collection
+            FROM documents
+            WHERE site_id = ?
+              AND json_extract(extra_metadata, '$.collection') IS NOT NULL
+              AND json_extract(extra_metadata, '$.collection') != ''
+            ORDER BY collection
+            """,
+            (site_id,),
+        )
+        collections = [row['collection'] for row in cursor.fetchall()]
+
+    return jsonify({
+        'items': items,
+        'total': total,
+        'page': page,
+        'page_size': page_size,
+        'collections': collections,
+    })
+
+
+@app.route('/api/sites/<int:site_id>/semantic-search', methods=['POST'])
+def semantic_search_documents(site_id):
+    payload = request.get_json(silent=True) or {}
+    query = (payload.get('query') or '').strip()
+    site_ids = payload.get('site_ids')
+
+    try:
+        limit = int(payload.get('limit', 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    if not query:
+        return jsonify({'error': 'Requête vide'}), 400
+
+    if site_ids is not None:
+        if not isinstance(site_ids, (list, tuple)):
+            return jsonify({'error': 'site_ids doit être une liste'}), 400
+        target_site_ids = []
+        for raw_id in site_ids:
+            try:
+                target_site_ids.append(int(raw_id))
+            except (TypeError, ValueError):
+                return jsonify({'error': 'site_ids doit contenir des entiers'}), 400
+        target_site_ids = sorted({sid for sid in target_site_ids if sid >= 0})
+        if not target_site_ids:
+            target_site_ids = [site_id]
+    else:
+        target_site_ids = [site_id]
+
+    embedding_model = get_embedding_model()
+    if embedding_model is None:
+        return jsonify({'error': "Modèle d'embedding indisponible"}), 503
+
+    try:
+        query_vector = embedding_model.encode(query, convert_to_numpy=True, normalize_embeddings=True)
+    except Exception as exc:
+        return jsonify({'error': f"Impossible de générer l'embedding de la requête: {exc}"}), 500
+
+    if hasattr(query_vector, 'tolist'):
+        query_vector = query_vector.tolist()
+
+    placeholders = ','.join('?' for _ in target_site_ids)
+    sql = f"""
+        SELECT id, site_id, url, filename, title, file_type, file_size, last_modified, added_at,
+               local_path, downloaded, accessible, analysis_status, ai_analysis,
+               extra_metadata, full_text_path
+        FROM documents
+        WHERE site_id IN ({placeholders})
+    """
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, tuple(target_site_ids))
+        records = cursor.fetchall()
+
+    scored_items = []
+    collections = set()
+
+    for row in records:
+        record = dict(row)
+        metadata = {}
+        if record.get('extra_metadata'):
+            try:
+                metadata = json.loads(record['extra_metadata'])
+            except json.JSONDecodeError:
+                metadata = {}
+
+        embedding_info = metadata.get('embedding') or {}
+        vector = embedding_info.get('vector')
+        if not vector:
+            continue
+        if len(vector) != len(query_vector):
+            continue
+
+        try:
+            score = float(sum(float(a) * float(b) for a, b in zip(query_vector, vector)))
+        except (TypeError, ValueError):
+            continue
+
+        collect_status = 'success' if record.get('accessible') else 'error'
+        download_status = 'success' if record.get('downloaded') else 'pending'
+        if record.get('downloaded') == 0 and record.get('local_path') and not os.path.exists(record['local_path']):
+            download_status = 'error'
+
+        analyze_raw_status = (record.get('analysis_status') or '').lower()
+        if analyze_raw_status == 'completed':
+            analyze_status = 'success'
+        elif analyze_raw_status == 'error':
+            analyze_status = 'error'
+        elif analyze_raw_status in ['processing', 'running']:
+            analyze_status = 'running'
+        elif analyze_raw_status in ['stopped', 'cancelled']:
+            analyze_status = analyze_raw_status
+        else:
+            analyze_status = 'pending'
+
+        phases = {
+            'collect': collect_status,
+            'download': download_status,
+            'analyze': analyze_status,
+        }
+
+        if metadata.get('collection'):
+            collections.add(metadata['collection'])
+
+        analysis_payload = None
+        if record.get('ai_analysis'):
+            try:
+                analysis_payload = json.loads(record['ai_analysis'])
+            except json.JSONDecodeError:
+                analysis_payload = record['ai_analysis']
+
+        scored_items.append({
+            'score': score,
+            'item': {
+                'id': record['id'],
+                'site_id': record['site_id'],
+                'url': record['url'],
+                'filename': record['filename'],
+                'title': record['title'],
+                'file_type': record['file_type'],
+                'file_size': record['file_size'],
+                'last_modified': record['last_modified'],
+                'added_at': record['added_at'],
+                'local_path': record['local_path'],
+                'metadata': metadata,
+                'collection': metadata.get('collection'),
+                'number': metadata.get('number'),
+                'year': metadata.get('year'),
+                'document_date': metadata.get('document_date'),
+                'phases': phases,
+                'analysis_status': record.get('analysis_status'),
+                'analysis': analysis_payload,
+                'full_text_path': record.get('full_text_path'),
+            }
+        })
+
+    scored_items.sort(key=lambda entry: entry['score'], reverse=True)
+    selected = scored_items[:limit]
+
+    items = []
+    for entry in selected:
+        payload = entry['item']
+        payload['semantic_score'] = entry['score']
+        items.append(payload)
+
+    return jsonify({
+        'items': items,
+        'total': len(scored_items),
+        'limit': limit,
+        'query': query,
+        'model': EMBEDDING_MODEL_NAME,
+        'collections': sorted(list(collections)),
+        'site_ids': target_site_ids,
+    })
+
+@app.route('/api/sites/<int:site_id>/documents/delete', methods=['POST'])
+def delete_site_documents(site_id):
+    payload = request.get_json(silent=True) or {}
+    doc_ids = payload.get('document_ids') or []
+    if not doc_ids:
+        return jsonify({'error': 'Aucun document sélectionné'}), 400
+
+    placeholders = ','.join('?' for _ in doc_ids)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT id, local_path FROM documents WHERE site_id = ? AND id IN ({placeholders})",
+            (site_id, *doc_ids),
+        )
+        rows = cursor.fetchall()
+        for row in rows:
+            local_path = row['local_path']
+            if local_path and os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+            txt_path = None
+            if local_path:
+                txt_path = os.path.splitext(local_path)[0] + '.txt'
+            if txt_path and os.path.exists(txt_path):
+                try:
+                    os.remove(txt_path)
+                except OSError:
+                    pass
+        cursor.execute(
+            f"DELETE FROM documents WHERE site_id = ? AND id IN ({placeholders})",
+            (site_id, *doc_ids),
+        )
+    return jsonify({'success': True, 'deleted': len(doc_ids)})
+
+
+@app.route('/api/sites/<int:site_id>', methods=['DELETE'])
+def delete_site(site_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM sites WHERE id = ?", (site_id,))
+        site = cursor.fetchone()
+        if not site:
+            return jsonify({'error': 'Site introuvable'}), 404
+
+        cursor.execute("SELECT local_path FROM documents WHERE site_id = ?", (site_id,))
+        for row in cursor.fetchall():
+            local_path = row['local_path']
+            if local_path and os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+            txt_path = None
+            if local_path:
+                txt_path = os.path.splitext(local_path)[0] + '.txt'
+            if txt_path and os.path.exists(txt_path):
+                try:
+                    os.remove(txt_path)
+                except OSError:
+                    pass
+
+        cursor.execute("DELETE FROM documents WHERE site_id = ?", (site_id,))
+        cursor.execute("DELETE FROM harvest_sessions WHERE site_id = ?", (site_id,))
+        cursor.execute("DELETE FROM harvest_parameters WHERE site_id = ?", (site_id,))
+        cursor.execute("DELETE FROM site_archive WHERE site_id = ?", (site_id,))
+        cursor.execute("DELETE FROM site_archive_scans WHERE site_id = ?", (site_id,))
+        cursor.execute("DELETE FROM sites WHERE id = ?", (site_id,))
+
+    return jsonify({'success': True})
+
+
+@app.route('/api/archive/<int:site_id>/stats', methods=['GET'])
+def get_site_archive_stats(site_id):
+    """Retourne des statistiques globales sur l'archive d'un site."""
+    ensure_archive_tables()
+    site, _ = load_site_with_parameters(site_id)
+    if not site:
+        return jsonify({'error': 'Site introuvable'}), 404
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total_documents,
+                COALESCE(SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END), 0) AS downloaded,
+                COALESCE(SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END), 0) AS available,
+                COALESCE(SUM(CASE WHEN status = 'checking' THEN 1 ELSE 0 END), 0) AS checking,
+                COALESCE(SUM(CASE WHEN status LIKE 'error%' THEN 1 ELSE 0 END), 0) AS errors,
+                COALESCE(SUM(file_size), 0) AS total_size
+            FROM site_archive
+            WHERE site_id = ?
+            """,
+            (site_id,),
+        )
+        totals = cursor.fetchone() or {
+            'total_documents': 0,
+            'downloaded': 0,
+            'available': 0,
+            'checking': 0,
+            'errors': 0,
+            'total_size': 0,
+        }
+
+        cursor.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM site_archive
+            WHERE site_id = ?
+            GROUP BY status
+            """,
+            (site_id,),
+        )
+        status_breakdown = {row['status']: row['count'] for row in cursor.fetchall()}
+
+        cursor.execute(
+            """
+            SELECT year,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+                   SUM(CASE WHEN status LIKE 'error%' THEN 1 ELSE 0 END) AS errors
+            FROM site_archive
+            WHERE site_id = ? AND year IS NOT NULL
+            GROUP BY year
+            ORDER BY year
+            """,
+            (site_id,),
+        )
+        per_year = [
+            {
+                'year': row['year'],
+                'total': row['total'],
+                'downloaded': row['downloaded'] or 0,
+                'errors': row['errors'] or 0,
+            }
+            for row in cursor.fetchall()
+        ]
+
+        cursor.execute(
+            """
+            SELECT id, site_id, scan_type, status, started_at, completed_at,
+                   total_checked, found_available, found_errors, parameters
+            FROM site_archive_scans
+            WHERE site_id = ?
+            ORDER BY started_at DESC
+            LIMIT 5
+            """,
+            (site_id,),
+        )
+        recent_scans = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            raw_params = item.get('parameters')
+            if raw_params:
+                try:
+                    item['parameters'] = json.loads(raw_params)
+                except json.JSONDecodeError:
+                    item['parameters'] = {}
+            else:
+                item['parameters'] = {}
+            recent_scans.append(item)
+
+    response = {
+        'site': {
+            'id': site['id'],
+            'base_url': site['base_url'],
+            'created_at': site['created_at'],
+            'updated_at': site['updated_at'],
+            'last_harvest_at': site['last_harvest_at'],
+            'total_documents': site['total_documents'],
+        },
+        'totals': {
+            'documents': totals['total_documents'] or 0,
+            'downloaded': totals['downloaded'] or 0,
+            'available': totals['available'] or 0,
+            'checking': totals['checking'] or 0,
+            'errors': totals['errors'] or 0,
+            'storage_bytes': totals['total_size'] or 0,
+        },
+        'status_breakdown': status_breakdown,
+        'per_year': per_year,
+        'recent_scans': recent_scans,
+    }
+    return jsonify(response)
+
+
+@app.route('/api/archive/<int:site_id>/scan-year/<int:year>', methods=['POST'])
+def trigger_site_archive_scan_year(site_id, year):
+    """Lance un scan d'archive pour une année donnée et un site."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        scan_id, config = start_site_archive_scan_year(site_id, year, payload)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    with archive_scan_lock:
+        job_snapshot = archive_scan_jobs.get(scan_id, {}).copy()
+
+    return jsonify({
+        'scan_id': scan_id,
+        'site_id': site_id,
+        'year': year,
+        'status': 'started',
+        'job': job_snapshot,
+        'config': config
+    }), 202
+
+
+@app.route('/api/document/<int:doc_id>/redownload', methods=['POST'])
+def redownload_document(doc_id):
+    """Re-télécharge un document si le fichier local est manquant"""
+    success, info, state = redownload_document_internal(doc_id)
+    
+    if not success and state == 'error' and info == "Document introuvable":
+        return jsonify({'error': info}), 404
+    
+    if success:
+        return jsonify({
+            'success': True,
+            'message': 'Document re-téléchargé avec succès',
+            'local_path': info.get('local_path')
+        })
+    
+    return jsonify({
+        'success': False,
+        'error': info
+    }), 500
+
+
+@app.route('/api/documents/<int:doc_id>/file', methods=['GET'])
+def get_document_file(doc_id):
+    doc = get_document_by_id(doc_id)
+    if not doc:
+        return jsonify({'error': 'Document introuvable'}), 404
+
+    local_path = doc.get('local_path')
+    if not local_path or not os.path.exists(local_path):
+        return jsonify({'error': 'Fichier local introuvable'}), 404
+
+    try:
+        return send_file(local_path, as_attachment=False, download_name=os.path.basename(local_path))
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/documents/<int:doc_id>/phase/<phase>/start', methods=['POST'])
+def start_document_phase(doc_id, phase):
+    phase = (phase or '').lower()
+    if phase not in DOCUMENT_PHASES:
+        return jsonify({'error': 'Phase invalide'}), 400
+    try:
+        job_id = create_document_job(doc_id, phase)
+        return jsonify({'job_id': job_id})
+    except LookupError:
+        return jsonify({'error': 'Document introuvable'}), 404
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/documents/jobs/<job_id>', methods=['GET'])
+def get_document_job_status(job_id):
+    payload = serialize_document_job(job_id)
+    if not payload:
+        return jsonify({'error': 'Job introuvable'}), 404
+    return jsonify(payload)
+
+
+@app.route('/api/documents/jobs/<job_id>/stop', methods=['POST'])
+def stop_document_job(job_id):
+    job = document_jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job introuvable'}), 404
+    if job['status'] not in ['pending', 'running']:
+        return jsonify({'error': "Le job n'est pas en cours"}), 400
+    job['requested_action'] = 'stop'
+    job['stop_event'].set()
+    return jsonify({'status': 'stopping'})
+
+
+@app.route('/api/documents/jobs/<job_id>/cancel', methods=['POST'])
+def cancel_document_job(job_id):
+    job = document_jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job introuvable'}), 404
+    if job['status'] not in ['pending', 'running']:
+        return jsonify({'error': "Le job ne peut pas être annulé"}), 400
+    job['requested_action'] = 'cancel'
+    job['stop_event'].set()
+    return jsonify({'status': 'cancelling'})
+
+
+@app.route('/api/documents/jobs/<job_id>/resume', methods=['POST'])
+def resume_document_job(job_id):
+    job = document_jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job introuvable'}), 404
+    if job['status'] not in ['stopped', 'error', 'cancelled']:
+        return jsonify({'error': "Le job ne peut pas être repris"}), 400
+    try:
+        new_job_id = create_document_job(job['doc_id'], job['phase'])
+        document_jobs[new_job_id]['resume_of'] = job_id
+        return jsonify({'job_id': new_job_id})
+    except LookupError:
+        return jsonify({'error': 'Document introuvable'}), 404
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM harvest_sessions")
+            session_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM documents")
+            doc_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM documents WHERE downloaded = 1")
+            downloaded_count = cursor.fetchone()[0]
+        
+        # Vérifier le répertoire de stockage
+        storage_exists = os.path.exists(STORAGE_BASE_PATH)
+        storage_writable = os.access(STORAGE_BASE_PATH, os.W_OK) if storage_exists else False
+        
+        return jsonify({
+            'status': 'healthy',
+            'database': 'connected',
+            'selenium_available': SELENIUM_AVAILABLE,
+            'storage': {
+                'base_path': STORAGE_BASE_PATH,
+                'exists': storage_exists,
+                'writable': storage_writable
+            },
+            'statistics': {
+                'total_sessions': session_count,
+                'total_documents': doc_count,
+                'downloaded_files': downloaded_count
+            },
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+
+# ==========================================
+# ASSISTANT IA - Route pour le chat
+# ==========================================
+
+@app.route('/api/assistant/chat', methods=['POST'])
+def assistant_chat():
+    """Route pour dialoguer avec l'assistant de configuration"""
+    import requests
+    
+    try:
+        data = request.json
+        messages = data.get('messages', [])
+        system_prompt = data.get('system', '')
+        
+        # Appel à l'API Claude via requests
+        api_response = requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'Content-Type': 'application/json',
+                'x-api-key': get_api_key(),
+                'anthropic-version': '2023-06-01'
+            },
+            json={
+                'model': 'claude-sonnet-4-20250514',
+                'max_tokens': 2000,
+                'messages': messages,
+                'system': system_prompt
+            },
+            timeout=30
+        )
+        
+        if api_response.status_code == 200:
+            return jsonify(api_response.json())
+        else:
+            error_msg = f'API error: {api_response.status_code}'
+            print(error_msg)
+            return jsonify({'error': error_msg}), api_response.status_code
+            
+    except requests.exceptions.Timeout:
+        print("Timeout lors de l'appel à l'API Claude")
+        return jsonify({'error': 'Request timeout'}), 408
+    except Exception as e:
+        print(f"Erreur assistant: {e}")
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    print("=" * 80)
+    print("🚀 API Moissonneur de Documents - Version avec Téléchargement Automatique")
+    print("=" * 80)
+    print(f"\n📊 Base de données: {DB_PATH}")
+    print(f"📁 Stockage des fichiers: {STORAGE_BASE_PATH}")
+    
+    # Vérifier la connexion à la BD
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM harvest_sessions")
+            session_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM documents")
+            doc_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM documents WHERE downloaded = 1")
+            downloaded_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM sites")
+            site_count = cursor.fetchone()[0]
+            
+            print(f"\n✅ Base de données connectée")
+            print(f"   • {site_count} site(s)")
+            print(f"   • {session_count} session(s) de moissonnage")
+            print(f"   • {doc_count} document(s) ({downloaded_count} téléchargés)")
+    except Exception as e:
+        print(f"\n❌ Erreur de connexion à la base de données: {e}")
+    
+    # Vérifier le répertoire de stockage
+    if os.path.exists(STORAGE_BASE_PATH):
+        print(f"\n✅ Répertoire de stockage accessible")
+        if os.access(STORAGE_BASE_PATH, os.W_OK):
+            print(f"   • Permissions d'écriture: OK")
+        else:
+            print(f"   ⚠️  Permissions d'écriture: MANQUANTES")
+    else:
+        print(f"\n⚠️  Répertoire de stockage n'existe pas: {STORAGE_BASE_PATH}")
+        print(f"   Le répertoire sera créé automatiquement au premier téléchargement")
+    
+    print("\n✨ NOUVEAUTÉS:")
+    print("   • Téléchargement automatique des PDFs après moissonnage")
+    print("   • Organisation par site et sous-dossier (année)")
+    print("   • Suppression physique lors de la suppression d'un document")
+    print("   • Endpoint de re-téléchargement si fichier manquant")
+    print("   • Nom de fichier = URL (unicité garantie)")
+    
+    print("\n📡 Endpoints disponibles:")
+    print("  GET  /api/harvesters          - Liste des moissonneurs")
+    print("  POST /api/harvest             - Lancer un moissonnage + téléchargement")
+    print("  GET  /api/harvest/<id>        - Statut d'un moissonnage")
+    print("  GET  /api/harvest/<id>/results - Résultats")
+    print("  GET  /api/harvest/<id>/export  - Exporter en JSON")
+    print("  POST /api/harvest/<id>/document/<idx>/delete - Supprimer document + fichier")
+    print("  POST /api/harvest/<id>/document/<idx>/rename - Renommer un document")
+    print("  POST /api/document/<id>/redownload - Re-télécharger un fichier")
+    print("  POST /api/duplicates          - Détecter les doublons")
+    print("  GET  /api/jobs                - Liste tous les jobs")
+    print("  DELETE /api/jobs/<id>         - Supprimer un job + fichiers")
+    print("  POST /api/jobs/bulk-delete    - Supprimer plusieurs jobs + fichiers")
+    print("  GET  /api/health              - Santé de l'API + stats stockage")
+    
+    print("\n💡 Règles de gestion:")
+    print("   • Les doublons ne sont JAMAIS insérés (UNIQUE sur site_id + url)")
+    print("   • Les sessions sans nouveaux documents sont supprimées automatiquement")
+    print("   • Les fichiers sont téléchargés APRÈS l'enregistrement en BD")
+    print("   • Suppression d'un document = suppression du fichier physique")
+    
+    print("\n" + "=" * 80)
+    print("\n🌐 Serveur démarré sur http://localhost:5000")
+    print("💡 Ouvrez l'application React sur http://localhost:3000\n")
+    
+    app.run(debug=True, port=5001)

@@ -1,0 +1,57 @@
+# macOS cruft
+.DS_Store
+Thumbs.db
+Icon?
+
+# Python bytecode / venvs
+**/__pycache__/
+**/*.py[cod]
+**/*.pyo
+**/*.pyd
+**/*.egg-info/
+pip-log.txt
+pip-delete-this-directory.txt
+**/venv/
+**/.venv/
+**/venv/*
+**/.venv*
+
+# Node / frontend
+**/node_modules/
+**/dist/
+**/build/
+**/.parcel-cache/
+
+# Databases & runtime artifacts
+*.db
+*.sqlite3
+*.log
+*.pid
+*.seed
+*.cache
+
+# Environment configs
+.env
+.env.*
+!.env.example
+
+# Tooling
+**/.history
+**/.wrangler
+**/.idea
+**/.vscode
+
+# Local backup metadata
+AA/.git.backup
+BB/.git.backup
+BB/clé-API-Claude.rtf
+BB-old/clé-API-Claude.rtf
+
+# Archives / bundles
+*.zip
+*.tar.gz
+*.tgz
+*.7z
+
+# Misc
+\.DS_Store
