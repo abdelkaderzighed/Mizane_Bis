@@ -13,6 +13,7 @@ import { MizaneHeader } from './components/MisanHeader';
 import { UserAlerts } from './components/UserAlerts';
 import { ClientWorkspacePanel } from './components/ClientWorkspacePanel';
 import { CollapsibleFooter } from './components/CollapsibleFooter';
+import LibraryPage from './pages/library/LibraryPage';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from './components/ui/sheet';
 import { Tooltip, TooltipContent, TooltipTrigger } from './components/ui/tooltip';
 import { EditorActions } from './components/EditorActions';
@@ -111,46 +112,6 @@ import {
 } from './utils/templateUtils';
 import { ensureWorkspaceDirectories } from './utils/workspaceUtils';
 import { isRtf, rtfToPlainText } from './utils/rtfUtils';
-
-const LIBRARY_VIEWER_URL = import.meta.env.VITE_LIBRARY_URL ?? 'http://localhost:3000/?mode=library';
-const LIBRARY_UNAVAILABLE_MESSAGE =
-  import.meta.env.VITE_LIBRARY_UNAVAILABLE_MESSAGE ?? 'La bibliothèque est temporairement indisponible. Revenez dans quelques instants.';
-
-interface LibraryViewerProps {
-  src: string;
-  title?: string;
-}
-
-function LibraryViewer({
-  src,
-  title = 'Bibliothèque juridique algérienne',
-  unavailableMessage = LIBRARY_UNAVAILABLE_MESSAGE,
-}: LibraryViewerProps & { unavailableMessage?: string }) {
-  const [isUnavailable, setIsUnavailable] = React.useState(false);
-  return (
-    <section className="relative flex-1 h-full min-h-[520px] overflow-hidden rounded-none bg-transparent">
-      <iframe
-        src={src}
-        title={title}
-        loading="lazy"
-        onLoad={() => setIsUnavailable(false)}
-        onError={() => setIsUnavailable(true)}
-        className="absolute inset-0 h-full w-full border-0"
-      />
-
-      <div className="absolute inset-0 pointer-events-none">
-        <div className="absolute inset-x-0 top-0 h-20 bg-gradient-to-b from-emerald-900/50 via-transparent to-transparent" />
-      </div>
-
-      {isUnavailable && (
-        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-900/90 p-6 text-center text-white">
-          <p className="text-lg font-semibold">La bibliothèque est temporairement indisponible</p>
-          <p className="text-sm text-white/70">{unavailableMessage}</p>
-        </div>
-      )}
-    </section>
-  );
-}
 
 const SPEECH_LANGUAGE_MAP: Record<LanguageCode, string> = {
   fr: 'fr-FR',
@@ -2748,13 +2709,12 @@ export default function App() {
         <MizaneHeader {...headerProps} />
         <div className="h-screen flex flex-col bg-background">
           <main className="flex-1 flex flex-col px-6 py-10">
-            <div className="flex flex-1 flex-col mx-auto w-full max-w-6xl space-y-8">
+            <div className="flex flex-1 flex-col mx-auto w-full max-w-full space-y-8">
               <div className="space-y-3">
                 <p className="text-xs uppercase tracking-[0.5em] text-emerald-600">bibliothèque juridique algérienne</p>
-                <h1 className="text-3xl font-bold text-slate-950">Bibliothèque juridique algérienne</h1>
               </div>
               <div className="flex flex-1">
-                <LibraryViewer src={LIBRARY_VIEWER_URL} />
+                <LibraryPage />
               </div>
             </div>
           </main>
