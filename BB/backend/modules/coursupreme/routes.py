@@ -2,8 +2,22 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request, send_file, Response
 import sqlite3
 import sys
+import re
 from pathlib import Path
 import requests
+import unicodedata
+from datetime import datetime
+import numpy as np
+import os
+import io
+import zipfile
+import time
+from html import unescape
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+USE_SEMANTIC_SEARCH = os.getenv("COURSUPREME_ENABLE_SEMANTIC", "0") == "1"
 
 from shared.r2_storage import (
     generate_presigned_url,
@@ -13,6 +27,170 @@ from shared.r2_storage import (
     normalize_key,
     R2ConfigurationError,
 )
+
+NORMALIZED_DECISION_DATE = (
+    "CASE WHEN length(decision_date)=10 AND substr(decision_date,3,1)='-' AND substr(decision_date,6,1)='-' "
+    "THEN substr(decision_date,7,4)||'-'||substr(decision_date,4,2)||'-'||substr(decision_date,1,2) "
+    "ELSE decision_date END"
+)
+
+
+def normalize_term(value):
+    if not value:
+        return ''
+    normalized = unicodedata.normalize('NFD', str(value))
+    normalized = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    return normalized.lower().strip()
+
+def _strip_html(value: str | None) -> str:
+    if not value:
+        return ''
+    text = re.sub('<[^<]+?>', '', value)
+    return unescape(text).strip()
+
+def _build_decision_filename(decision: dict, lang: str) -> str:
+    number = decision.get('decision_number') or str(decision.get('id', 'doc'))
+    date = (decision.get('decision_date') or '').replace('-', '')
+    safe = re.sub(r'[^0-9A-Za-z_-]', '_', f"{number}_{lang}_{date}")
+    return f"decision_{safe}.txt"
+
+
+def parse_fuzzy_date(value, is_end=False):
+    if not value:
+        return None
+    value = value.strip()
+    candidates = [
+        ('%d/%m/%Y', '%Y-%m-%d'),
+        ('%Y-%m-%d', '%Y-%m-%d'),
+        ('%Y/%m/%d', '%Y-%m-%d'),
+        ('%m/%Y', '%Y-%m-%d'),
+        ('%Y-%m', '%Y-%m-%d'),
+        ('%Y', '%Y-%m-%d'),
+    ]
+    for fmt, target_fmt in candidates:
+        try:
+            dt = datetime.strptime(value, fmt)
+            if fmt in ('%Y', '%Y-%m', '%m/%Y'):
+                if fmt == '%Y':
+                    month = 1 if not is_end else 12
+                    day = 1 if not is_end else 31
+                else:
+                    month = dt.month
+                    day = 1 if not is_end else 31
+                dt = datetime(dt.year, month, day)
+            elif fmt == '%Y-%m':
+                day = 1 if not is_end else 31
+                dt = datetime(dt.year, dt.month, day)
+            return dt.strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return '9999-12-31' if is_end else '1900-01-01'
+
+
+FRENCH_INDEX_TABLE = 'french_keyword_index'
+FRENCH_INDEX_FIELDS = ['object_fr', 'summary_fr', 'title_fr']
+TOKEN_PATTERN = re.compile(r'[a-z0-9]+')
+
+EMBEDDING_MODEL = None
+
+
+def extract_french_tokens(value: str) -> list:
+    if not value:
+        return []
+    normalized = normalize_term(value)
+    return TOKEN_PATTERN.findall(normalized)
+
+
+def ensure_french_index(conn: sqlite3.Connection) -> None:
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {FRENCH_INDEX_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT NOT NULL,
+            decision_id INTEGER NOT NULL
+        )
+    """)
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{FRENCH_INDEX_TABLE}_token ON {FRENCH_INDEX_TABLE}(token)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{FRENCH_INDEX_TABLE}_decision ON {FRENCH_INDEX_TABLE}(decision_id)")
+
+
+def rebuild_french_index_entries(conn: sqlite3.Connection) -> int:
+    ensure_french_index(conn)
+    cursor = conn.cursor()
+    cursor.execute(f"DELETE FROM {FRENCH_INDEX_TABLE}")
+    cursor.execute(f"""
+        SELECT id, {', '.join(FRENCH_INDEX_FIELDS)}
+        FROM supreme_court_decisions
+    """)
+    rows = cursor.fetchall()
+    entries = []
+    for row in rows:
+        decision_id = row[0]
+        tokens = set()
+        for idx, field in enumerate(FRENCH_INDEX_FIELDS, start=1):
+            tokens.update(extract_french_tokens(row[idx]))
+        for token in tokens:
+            entries.append((token, decision_id))
+    if entries:
+        cursor.executemany(f"""
+            INSERT INTO {FRENCH_INDEX_TABLE}(token, decision_id)
+            VALUES (?, ?)
+        """, entries)
+    conn.commit()
+    return len(entries)
+
+
+def tokenize_query_param(value: str) -> list:
+    tokens = []
+    for part in value.split(','):
+        tokens.extend(extract_french_tokens(part))
+    return [token for token in tokens if token]
+
+
+def get_decision_ids_for_token(cursor: sqlite3.Cursor, token: str) -> set:
+    cursor.execute(f"SELECT decision_id FROM {FRENCH_INDEX_TABLE} WHERE token = ?", (token,))
+    return {row[0] for row in cursor.fetchall()}
+
+
+def get_embedding_model():
+    global EMBEDDING_MODEL
+    if EMBEDDING_MODEL is not None:
+        return EMBEDDING_MODEL
+    if not USE_SEMANTIC_SEARCH:
+        fallback_results, fallback_count = run_text_fallback(limit)
+        return jsonify({
+            'results': fallback_results,
+            'count': fallback_count,
+            'max_score': None,
+            'min_score': None,
+            'score_threshold': score_threshold,
+            'limit': limit,
+            'error': 'semantic search disabled, fallback applied'
+        })
+
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception:
+        return None
+    EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    return EMBEDDING_MODEL
+
+
+def decode_embedding(blob):
+    if not blob:
+        return None
+    if isinstance(blob, memoryview):
+        blob = blob.tobytes()
+    return np.frombuffer(blob, dtype=np.float32)
+
+
+def cosine_similarity(query_vec, target_vec):
+    if query_vec is None or target_vec is None:
+        return None
+    numerator = float(np.dot(query_vec, target_vec))
+    denominator = np.linalg.norm(query_vec) * np.linalg.norm(target_vec)
+    if denominator == 0:
+        return None
+    return numerator / denominator
 
 coursupreme_bp = Blueprint('coursupreme', __name__)
 DB_PATH = 'harvester.db'
@@ -63,6 +241,7 @@ def _delete_r2_object(raw_path: str | None) -> bool:
 def get_chambers():
     try:
         conn = sqlite3.connect(DB_PATH)
+        conn.create_function("normalize_text", 1, lambda value: normalize_term(value))
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
@@ -313,8 +492,10 @@ def get_decisions_status():
                 d.html_content_fr,
                 d.title_ar,
                 d.title_fr,
-                d.summary_ar,
-                d.summary_fr,
+            d.summary_ar,
+            d.summary_fr,
+            d.object_ar,
+            d.object_fr,
                 d.keywords_ar,
                 d.keywords_fr,
                 d.entities_ar,
@@ -402,7 +583,11 @@ def get_decisions_status():
                     'embeddings': embeddings_status
                 },
                 'chambers': chambers,
-                'themes': themes
+                'themes': themes,
+                'summary_ar': dec['summary_ar'],
+                'summary_fr': dec['summary_fr'],
+                'object_ar': dec['object_ar'],
+                'object_fr': dec['object_fr']
             })
 
         conn.close()
@@ -1179,71 +1364,266 @@ def get_chamber_all_ids(chamber_id):
         return jsonify({'error': str(e)}), 500
 
 
+@coursupreme_bp.route('/index/french/rebuild', methods=['POST'])
+def rebuild_french_index():
+    """Regénérer l’index inversé français."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        inserted = rebuild_french_index_entries(conn)
+        conn.close()
+        return jsonify({'inserted': inserted})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @coursupreme_bp.route('/search/advanced', methods=['GET'])
 def advanced_search():
     """Recherche avancée avec keywords inclusifs/exclusifs et dates"""
-    from flask import request
 
     keywords_inc = request.args.get('keywords_inc', '')
+    keywords_or = request.args.get('keywords_or', '')
     keywords_exc = request.args.get('keywords_exc', '')
     decision_number = request.args.get('decision_number', '')
     date_from = request.args.get('date_from', '')
     date_to = request.args.get('date_to', '')
+    language_scope = request.args.get('language_scope', 'both')
+
+    keywords_inc_tokens = tokenize_query_param(keywords_inc)
+    keywords_or_tokens = tokenize_query_param(keywords_or)
+    keywords_exc_tokens = tokenize_query_param(keywords_exc)
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        ensure_french_index(conn)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        where_clauses = []
+        params = []
+        order_parts = []
+        order_params = []
+
+        if decision_number:
+            where_clauses.append("decision_number LIKE ?")
+            params.append(f'%{decision_number}%')
+            order_parts.append("CASE WHEN decision_number LIKE ? THEN 0 ELSE 1 END")
+            order_params.append(f"{decision_number}%")
+
+        if date_from:
+            where_clauses.append(f"{NORMALIZED_DECISION_DATE} >= ?")
+            params.append(parse_fuzzy_date(date_from))
+        if date_to:
+            where_clauses.append(f"{NORMALIZED_DECISION_DATE} <= ?")
+            params.append(parse_fuzzy_date(date_to, is_end=True))
+
+        order_parts.append("decision_date DESC")
+        order_parts.append("decision_number ASC")
+
+        candidate_ids = None
+        if keywords_inc_tokens:
+            for token in keywords_inc_tokens:
+                ids = get_decision_ids_for_token(cursor, token)
+                if candidate_ids is None:
+                    candidate_ids = ids
+                else:
+                    candidate_ids &= ids
+                if not candidate_ids:
+                    cursor.close()
+                    conn.close()
+                    return jsonify({'results': [], 'count': 0})
+
+        if keywords_or_tokens:
+            or_ids = set()
+            for token in keywords_or_tokens:
+                or_ids |= get_decision_ids_for_token(cursor, token)
+            if candidate_ids is None:
+                candidate_ids = or_ids
+            else:
+                candidate_ids &= or_ids
+            if not candidate_ids:
+                cursor.close()
+                conn.close()
+                return jsonify({'results': [], 'count': 0})
+
+        if candidate_ids is not None:
+            where_clauses.append(f"id IN ({','.join('?' for _ in candidate_ids)})")
+            params.extend(sorted(candidate_ids))
+
+        if keywords_exc_tokens:
+            exc_ids = set()
+            for token in keywords_exc_tokens:
+                exc_ids |= get_decision_ids_for_token(cursor, token)
+            if exc_ids:
+                where_clauses.append(f"id NOT IN ({','.join('?' for _ in exc_ids)})")
+                params.extend(sorted(exc_ids))
+
+        where_sql = ' AND '.join(where_clauses) if where_clauses else '1=1'
+        order_parts_processed = [
+            part.replace('decision_date', NORMALIZED_DECISION_DATE)
+            if 'decision_date' in part else part
+            for part in order_parts
+        ]
+        order_sql = f"ORDER BY {', '.join(order_parts_processed)}" if order_parts_processed else f"ORDER BY {NORMALIZED_DECISION_DATE} DESC"
+
+        query = f"""
+            SELECT id, decision_number, decision_date,
+                   object_ar, object_fr,
+                   summary_ar, summary_fr,
+                   title_ar, title_fr,
+                   file_path_ar, file_path_fr,
+                   html_content_ar, html_content_fr
+            FROM supreme_court_decisions
+            WHERE {where_sql}
+            {order_sql}
+            LIMIT 100
+        """
+
+        cursor.execute(query, params + order_params)
+        candidates = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        return jsonify({'results': candidates, 'count': len(candidates)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@coursupreme_bp.route('/search/semantic', methods=['GET'])
+def semantic_search():
+    """Recherche sémantique par embedding (FR/AR/both)."""
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify({'error': 'Paramètre q requis'}), 400
+
+    try:
+        limit = int(request.args.get('limit', 10))
+    except ValueError:
+        limit = 10
+    limit = max(1, min(limit, 50))
+
+    try:
+        score_threshold = float(request.args.get('score_threshold', 0.35))
+    except ValueError:
+        score_threshold = 0.35
+    score_threshold = max(0.0, min(score_threshold, 1.0))
+
+    language_scope = request.args.get('language_scope', 'both')
+
+    def run_text_fallback(limit_count):
+        like_param = f"%{query}%"
+        with sqlite3.connect(DB_PATH) as fallback_conn:
+            fallback_conn.row_factory = sqlite3.Row
+            fallback_cursor = fallback_conn.cursor()
+            fallback_cursor.execute("""
+                SELECT
+                    id, decision_number, decision_date,
+                    object_ar, object_fr,
+                    summary_ar, summary_fr
+                FROM supreme_court_decisions
+                WHERE object_ar LIKE ?
+                   OR object_fr LIKE ?
+                   OR summary_ar LIKE ?
+                   OR summary_fr LIKE ?
+                   OR title_ar LIKE ?
+                   OR title_fr LIKE ?
+                LIMIT ?
+            """, (like_param, like_param, like_param, like_param, like_param, like_param, limit_count))
+        fallback_rows = [dict(row) for row in fallback_cursor.fetchall()]
+        return fallback_rows, len(fallback_rows)
+
+    if not USE_SEMANTIC_SEARCH:
+        fallback_results, fallback_count = run_text_fallback(limit)
+        return jsonify({
+            'results': fallback_results,
+            'count': fallback_count,
+            'max_score': None,
+            'min_score': None,
+            'score_threshold': score_threshold,
+            'limit': limit,
+            'error': 'semantic search disabled, fallback applied'
+        })
 
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-
-        # Construire la requête dynamiquement
-        where_clauses = []
-        params = []
-
-        # Keywords inclusifs (tous doivent être présents)
-        if keywords_inc:
-            keywords_list = [kw.strip() for kw in keywords_inc.split(',') if kw.strip()]
-            for kw in keywords_list:
-                where_clauses.append("(object_ar LIKE ? OR object_fr LIKE ? OR summary_ar LIKE ? OR summary_fr LIKE ?)")
-                params.extend([f'%{kw}%', f'%{kw}%', f'%{kw}%', f'%{kw}%'])
-
-        # Keywords exclusifs (aucun ne doit être présent)
-        if keywords_exc:
-            keywords_list = [kw.strip() for kw in keywords_exc.split(',') if kw.strip()]
-            for kw in keywords_list:
-                where_clauses.append("(object_ar NOT LIKE ? AND object_fr NOT LIKE ? AND summary_ar NOT LIKE ? AND summary_fr NOT LIKE ?)")
-                params.extend([f'%{kw}%', f'%{kw}%', f'%{kw}%', f'%{kw}%'])
-
-        # Numéro de décision
-        if decision_number:
-            where_clauses.append("decision_number LIKE ?")
-            params.append(f'%{decision_number}%')
-
-        # Dates
-        if date_from:
-            where_clauses.append("decision_date >= ?")
-            params.append(date_from)
-        if date_to:
-            where_clauses.append("decision_date <= ?")
-            params.append(date_to)
-
-        # Construire la requête SQL
-        where_sql = ' AND '.join(where_clauses) if where_clauses else '1=1'
-
-        query = f"""
-            SELECT id, decision_number, decision_date, object_ar, object_fr, url
+        cursor.execute("""
+            SELECT id, decision_number, decision_date,
+                   object_ar, object_fr,
+                   summary_ar, summary_fr,
+                   embedding_ar, embedding_fr
             FROM supreme_court_decisions
-            WHERE {where_sql}
-            ORDER BY decision_date DESC
-            LIMIT 100
-        """
-
-        cursor.execute(query, params)
-        results = [dict(row) for row in cursor.fetchall()]
+            WHERE (embedding_fr IS NOT NULL AND embedding_fr != '')
+               OR (embedding_ar IS NOT NULL AND embedding_ar != '')
+        """)
+        rows = cursor.fetchall()
         conn.close()
 
-        return jsonify({'results': results, 'count': len(results)})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        model = get_embedding_model()
+        if model is None:
+            raise RuntimeError("embedding model unavailable")
+        query_vec = model.encode(query, convert_to_numpy=True)
+
+        scored = []
+        for row in rows:
+            best_score = None
+            if language_scope in ('fr', 'both'):
+                emb_fr = decode_embedding(row['embedding_fr'])
+                score = cosine_similarity(query_vec, emb_fr)
+                if score is not None:
+                    best_score = score if best_score is None else max(best_score, score)
+            if language_scope in ('ar', 'both'):
+                emb_ar = decode_embedding(row['embedding_ar'])
+                score = cosine_similarity(query_vec, emb_ar)
+                if score is not None:
+                    best_score = score if best_score is None else max(best_score, score)
+            if best_score is not None:
+                if best_score >= score_threshold:
+                    scored.append({
+                        'id': row['id'],
+                        'decision_number': row['decision_number'],
+                        'decision_date': row['decision_date'],
+                        'object_ar': row['object_ar'],
+                        'object_fr': row['object_fr'],
+                        'summary_ar': row['summary_ar'],
+                        'summary_fr': row['summary_fr'],
+                        'score': round(best_score, 4)
+                    })
+
+        scored.sort(key=lambda entry: entry['score'], reverse=True)
+        returned = scored[:limit]
+        if returned:
+            max_score = returned[0]['score']
+            min_score = returned[-1]['score']
+            return jsonify({
+                'results': returned,
+                'count': len(scored),
+                'max_score': max_score,
+                'min_score': min_score,
+                'score_threshold': score_threshold,
+                'limit': limit
+            })
+
+        fallback_results, fallback_count = run_text_fallback(limit)
+        return jsonify({
+            'results': fallback_results,
+            'count': fallback_count,
+            'max_score': None,
+            'min_score': None,
+            'score_threshold': score_threshold,
+            'limit': limit,
+            'error': 'semantic search returned no matches, fallback applied'
+        })
+    except Exception as exc:
+        fallback_results, fallback_count = run_text_fallback(limit)
+        return jsonify({
+            'results': fallback_results,
+            'count': fallback_count,
+            'max_score': None,
+            'min_score': None,
+            'score_threshold': score_threshold,
+            'limit': limit,
+            'error': str(exc)
+        })
 
 
 @coursupreme_bp.route('/stats', methods=['GET'])
@@ -1370,3 +1750,65 @@ def load_html_content(in_memory_html, file_path):
     if not file_path:
         return None
     return _fetch_text_from_r2(file_path)
+
+@coursupreme_bp.route('/decisions/export', methods=['POST', 'OPTIONS'])
+def export_decisions():
+    if request.method == 'OPTIONS':
+        return jsonify({"success": True}), 200
+
+    data = request.get_json() or {}
+    ids = data.get('decision_ids') or data.get('document_ids') or []
+    numeric_ids = []
+    for value in ids:
+        try:
+            numeric_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    if not numeric_ids:
+        return jsonify({'error': 'decision_ids requis'}), 400
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    placeholders = ','.join('?' * len(numeric_ids))
+    cursor.execute(
+        f"""
+        SELECT id, decision_number, decision_date,
+               html_content_ar, html_content_fr,
+               file_path_ar, file_path_fr
+        FROM supreme_court_decisions
+        WHERE id IN ({placeholders})
+        """,
+        numeric_ids
+    )
+    decisions = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    if not decisions:
+        return jsonify({'error': 'Aucun document trouvé'}), 404
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
+        added = 0
+        for decision in decisions:
+            # Charger le contenu depuis la base ou, si absent, depuis R2
+            contents = {
+                'ar': decision.get('html_content_ar') or _fetch_text_from_r2(decision.get('file_path_ar')),
+                'fr': decision.get('html_content_fr') or _fetch_text_from_r2(decision.get('file_path_fr')),
+            }
+            for lang in ('ar', 'fr'):
+                content = contents.get(lang) or ''
+                if not content:
+                    continue
+                filename = _build_decision_filename(decision, lang)
+                archive.writestr(filename, _strip_html(content))
+                added += 1
+    if added == 0:
+        return jsonify({'error': 'Contenu indisponible'}), 400
+
+    buffer.seek(0)
+    download_name = f"coursupreme-decisions-{int(time.time())}.zip"
+    try:
+        return send_file(buffer, as_attachment=True, download_name=download_name, mimetype='application/zip')
+    except TypeError:
+        return send_file(buffer, as_attachment=True, attachment_filename=download_name, mimetype='application/zip')

@@ -1,10 +1,77 @@
-import React, { useState, useEffect } from 'react';
-import { Download, Eye, Globe, Database, Trash2, Search, ChevronDown, ChevronUp } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { Eye, Globe, Database, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
 import ConfirmationModal from './ConfirmationModal';
+import CoursSupremeSearchPanel from './CoursSupremeSearchPanel';
 
 const COURSUPREME_API_URL = 'http://localhost:5001/api/coursupreme';
 
-const DecisionStatusManager = () => {
+const SEMANTIC_SCORE_THRESHOLD = 0.45;
+const SEMANTIC_ITEM_LIMIT = 20;
+const DECISIONS_PAGE_SIZE = 20;
+
+const toIsoFromDecisionDate = (value) => {
+  if (!value) return null;
+  const cleaned = value.replace(/\//g, '-');
+  const parts = cleaned.split('-').filter(Boolean);
+  if (parts.length !== 3) return null;
+  let day = parts[0];
+  let month = parts[1];
+  let year = parts[2];
+  if (year.length !== 4 && parts[0].length === 4) {
+    year = parts[0];
+    month = parts[1];
+    day = parts[2];
+  }
+  if (year.length !== 4) return null;
+  return `${year.padStart(4, '0')}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+};
+
+const toIsoFromFilterDate = (value, isEnd = false) => {
+  if (!value) return null;
+  const cleaned = value.trim();
+  if (!cleaned) return null;
+  const segments = cleaned.replace(/\//g, '-').split('-').filter(Boolean);
+  if (!segments.length) return null;
+
+  let day = '01';
+  let month = '01';
+  let year = '';
+
+  if (segments.length >= 3) {
+    if (segments[0].length === 4) {
+      year = segments[0];
+      month = segments[1];
+      day = segments[2];
+    } else {
+      day = segments[0];
+      month = segments[1];
+      year = segments[2];
+    }
+  } else if (segments.length === 2) {
+    if (segments[0].length === 4) {
+      year = segments[0];
+      month = segments[1];
+      day = isEnd ? '31' : '01';
+    } else {
+      day = '01';
+      month = segments[0];
+      year = segments[1];
+    }
+  } else {
+    const segment = segments[0];
+    if (segment.length === 4) {
+      year = segment;
+      month = isEnd ? '12' : '01';
+      day = isEnd ? '31' : '01';
+    } else {
+      return null;
+    }
+  }
+
+  return `${year.padStart(4, '0')}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+};
+
+const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/joradp/documents/export' }) => {
   const [decisions, setDecisions] = useState([]);
   const [filteredDecisions, setFilteredDecisions] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -15,11 +82,28 @@ const DecisionStatusManager = () => {
   const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
   const [filters, setFilters] = useState({
     keywordsInclusive: '',
+    keywordsOr: '',
     keywordsExclusive: '',
     decisionNumber: '',
     dateFrom: '',
     dateTo: ''
   });
+  const [isSearching, setIsSearching] = useState(false);
+  const [languageScope, setLanguageScope] = useState('both');
+  const [activeSearchIds, setActiveSearchIds] = useState(null);
+  const [searchScoreMap, setSearchScoreMap] = useState(new Map());
+  const [searchResultsSnapshot, setSearchResultsSnapshot] = useState(null);
+  const [searchResultCount, setSearchResultCount] = useState(0);
+  const [semanticStats, setSemanticStats] = useState({
+    count: 0,
+    minScore: null,
+    maxScore: null,
+    scoreThreshold: SEMANTIC_SCORE_THRESHOLD,
+    limit: SEMANTIC_ITEM_LIMIT
+  });
+  const [semanticLimit, setSemanticLimit] = useState(SEMANTIC_ITEM_LIMIT);
+  const [semanticThreshold, setSemanticThreshold] = useState(SEMANTIC_SCORE_THRESHOLD);
+  const [currentPage, setCurrentPage] = useState(1);
 
   // Modal states
   const [confirmModal, setConfirmModal] = useState({
@@ -45,14 +129,197 @@ const DecisionStatusManager = () => {
   const [metadataModalOpen, setMetadataModalOpen] = useState(false);
   const [selectedMetadata, setSelectedMetadata] = useState(null);
   const [metadataLang, setMetadataLang] = useState('ar');
+  const totalPages = Math.max(1, Math.ceil(filteredDecisions.length / DECISIONS_PAGE_SIZE));
+  const paginatedDecisions = useMemo(() => {
+    const start = (currentPage - 1) * DECISIONS_PAGE_SIZE;
+    const end = start + DECISIONS_PAGE_SIZE;
+    return filteredDecisions.slice(start, end);
+  }, [filteredDecisions, currentPage]);
+  const handlePageChange = (direction) => {
+    setCurrentPage((prev) => {
+      const candidate = direction === 'next' ? prev + 1 : prev - 1;
+      return Math.max(1, Math.min(totalPages, candidate));
+    });
+  };
+
+  const semanticHasNumericScores = searchScoreMap.size > 0 && Array.from(searchScoreMap.values()).some(value => typeof value === 'number');
+  const showSemanticStats = semanticStats.count > 0 || semanticHasNumericScores;
+
+  useEffect(() => {
+    if (semanticStats.count === 0) return;
+    setSemanticStats((prev) => ({
+      ...prev,
+      scoreThreshold: semanticThreshold,
+      limit: semanticLimit,
+    }));
+  }, [semanticLimit, semanticThreshold, semanticStats.count]);
 
   useEffect(() => {
     fetchDecisions();
   }, []);
 
+  const sortDecisions = useCallback(
+    (list, scores = new Map()) => {
+      const sorted = [...list];
+      const numericScores =
+        scores && scores.size
+          ? Array.from(scores.values()).some((value) => typeof value === 'number')
+          : false;
+
+      if (numericScores) {
+        sorted.sort((a, b) => {
+          const scoreA = scores.get(a.id) ?? 0;
+          const scoreB = scores.get(b.id) ?? 0;
+          return scoreB - scoreA;
+        });
+      } else {
+        sorted.sort((a, b) => {
+          let aVal = a[sortField];
+          let bVal = b[sortField];
+
+          if (sortField === 'decision_date') {
+            aVal = new Date(aVal || '1900-01-01');
+            bVal = new Date(bVal || '1900-01-01');
+          } else {
+            aVal = aVal || '';
+            bVal = bVal || '';
+          }
+
+          if (sortOrder === 'asc') {
+            return aVal > bVal ? 1 : -1;
+          }
+          return aVal < bVal ? 1 : -1;
+        });
+      }
+
+      setFilteredDecisions(sorted);
+    },
+    [sortField, sortOrder],
+  );
+
+  const applyFiltersAndSort = useCallback(() => {
+    let filtered = [...decisions];
+
+    // Recherche simple
+    if (searchTerm) {
+      const lowerSearch = searchTerm.toLowerCase();
+      filtered = filtered.filter(
+        (d) =>
+          d.decision_number?.toLowerCase().includes(lowerSearch) ||
+          d.decision_date?.includes(searchTerm),
+      );
+    }
+
+    // Filtres avancés
+    if (filters.decisionNumber) {
+      filtered = filtered.filter((d) =>
+        d.decision_number?.toLowerCase().includes(filters.decisionNumber.toLowerCase()),
+      );
+    }
+
+    const getTextValues = (decision) =>
+      [
+        decision.summary_ar,
+        decision.summary_fr,
+        decision.object_ar,
+        decision.object_fr,
+      ].map((text) => text?.toLowerCase() || '');
+
+    const containsKeyword = (decision, keyword) => {
+      if (!keyword) return false;
+      return getTextValues(decision).some((value) => value.includes(keyword));
+    };
+
+    const applyKeywordCondition = (value, field) => {
+      const keywords = value
+        .split(',')
+        .map((kw) => kw.trim().toLowerCase())
+        .filter(Boolean);
+      if (!keywords.length) return filtered;
+      switch (field) {
+        case 'inclusive':
+          return filtered.filter((decision) =>
+            keywords.every((kw) => containsKeyword(decision, kw)),
+          );
+        case 'exclusive':
+          return filtered.filter((decision) =>
+            keywords.every((kw) => !containsKeyword(decision, kw)),
+          );
+        case 'or':
+        default:
+          return filtered.filter((decision) =>
+            keywords.some((kw) => containsKeyword(decision, kw)),
+          );
+      }
+    };
+
+    if (filters.keywordsInclusive) {
+      filtered = applyKeywordCondition(filters.keywordsInclusive, 'inclusive');
+    }
+
+    if (filters.keywordsExclusive) {
+      filtered = applyKeywordCondition(filters.keywordsExclusive, 'exclusive');
+    }
+
+    if (filters.keywordsOr) {
+      filtered = applyKeywordCondition(filters.keywordsOr, 'or');
+    }
+
+    const fromIso = toIsoFromFilterDate(filters.dateFrom);
+    if (fromIso) {
+      filtered = filtered.filter((d) => {
+        const decisionIso = toIsoFromDecisionDate(d.decision_date);
+        return decisionIso ? decisionIso >= fromIso : false;
+      });
+    }
+
+    const toIso = toIsoFromFilterDate(filters.dateTo, true);
+    if (toIso) {
+      filtered = filtered.filter((d) => {
+        const decisionIso = toIsoFromDecisionDate(d.decision_date);
+        return decisionIso ? decisionIso <= toIso : false;
+      });
+    }
+
+    setSearchResultCount(filtered.length);
+    sortDecisions(filtered);
+  }, [decisions, filters, searchTerm, sortDecisions]);
+
   useEffect(() => {
-    applyFiltersAndSort();
-  }, [decisions, sortField, sortOrder, searchTerm, filters]);
+    if (activeSearchIds !== null) {
+      const matches = Array.isArray(searchResultsSnapshot) && searchResultsSnapshot.length > 0
+        ? searchResultsSnapshot
+        : (activeSearchIds.size ? decisions.filter((decision) => activeSearchIds.has(decision.id)) : []);
+      sortDecisions(matches, searchScoreMap);
+    } else {
+      applyFiltersAndSort();
+    }
+  }, [
+    activeSearchIds,
+    decisions,
+    searchScoreMap,
+    searchResultsSnapshot,
+    applyFiltersAndSort,
+    sortDecisions,
+  ]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filteredDecisions]);
+
+  const resetSearchCriteria = () => {
+    setSearchTerm('');
+    setFilters({
+      keywordsInclusive: '',
+      keywordsOr: '',
+      keywordsExclusive: '',
+      decisionNumber: '',
+      dateFrom: '',
+      dateTo: ''
+    });
+    setLanguageScope('both');
+    setShowAdvancedSearch(false);
+  };
 
   const fetchDecisions = async () => {
     try {
@@ -66,53 +333,136 @@ const DecisionStatusManager = () => {
     }
   };
 
-  const applyFiltersAndSort = () => {
-    let filtered = [...decisions];
-
-    // Recherche simple
-    if (searchTerm) {
-      filtered = filtered.filter(d =>
-        d.decision_number.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        d.decision_date.includes(searchTerm)
-      );
-    }
-
-    // Filtres avancés
-    if (filters.decisionNumber) {
-      filtered = filtered.filter(d =>
-        d.decision_number.toLowerCase().includes(filters.decisionNumber.toLowerCase())
-      );
-    }
-
-    if (filters.dateFrom) {
-      filtered = filtered.filter(d => d.decision_date >= filters.dateFrom);
-    }
-
-    if (filters.dateTo) {
-      filtered = filtered.filter(d => d.decision_date <= filters.dateTo);
-    }
-
-    // Tri
-    filtered.sort((a, b) => {
-      let aVal = a[sortField];
-      let bVal = b[sortField];
-
-      if (sortField === 'decision_date') {
-        aVal = new Date(aVal || '1900-01-01');
-        bVal = new Date(bVal || '1900-01-01');
-      } else {
-        aVal = aVal || '';
-        bVal = bVal || '';
-      }
-
-      if (sortOrder === 'asc') {
-        return aVal > bVal ? 1 : -1;
-      } else {
-        return aVal < bVal ? 1 : -1;
-      }
+  const resetSemanticState = () => {
+    setSemanticStats({
+      count: 0,
+      minScore: null,
+      maxScore: null,
+      scoreThreshold: semanticThreshold,
+      limit: semanticLimit
     });
+  };
 
-    setFilteredDecisions(filtered);
+  const runSearch = () => {
+    const hasSearchTerm = Boolean(searchTerm && searchTerm.trim());
+    const hasAdvancedFilters = Boolean(
+      filters.keywordsInclusive ||
+      filters.keywordsOr ||
+      filters.keywordsExclusive ||
+      filters.decisionNumber ||
+      filters.dateFrom ||
+      filters.dateTo
+    );
+
+    setIsSearching(true);
+    const finalize = () => {
+      setIsSearching(false);
+    };
+
+    if (!hasSearchTerm && !hasAdvancedFilters) {
+      setActiveSearchIds(null);
+      setSearchScoreMap(new Map());
+      setSearchResultsSnapshot(null);
+      resetSemanticState();
+      applyFiltersAndSort();
+      finalize();
+      return;
+    }
+
+    if (hasSearchTerm && !hasAdvancedFilters) {
+      setActiveSearchIds(null);
+      setSearchScoreMap(new Map());
+      resetSemanticState();
+      const semanticParams = new URLSearchParams({
+        q: searchTerm,
+        language_scope: languageScope,
+        limit: semanticLimit.toString(),
+        score_threshold: semanticThreshold.toString()
+      });
+      fetch(`${COURSUPREME_API_URL}/search/semantic?${semanticParams.toString()}`)
+        .then((res) => res.json())
+        .then((data) => {
+          const results = data.results || [];
+          const ids = new Set(results.map((result) => result.id));
+          const scoreMap = new Map(results.map((result) => [result.id, result.score]));
+          setSearchResultsSnapshot(results);
+          setActiveSearchIds(ids);
+          setSearchScoreMap(ids.size ? scoreMap : new Map());
+          setSemanticStats({
+            count: data.count ?? results.length,
+            minScore: data.min_score ?? (results.length ? results[results.length - 1].score : null),
+            maxScore: data.max_score ?? (results.length ? results[0].score : null),
+            scoreThreshold: data.score_threshold ?? semanticThreshold,
+            limit: data.limit ?? semanticLimit
+          });
+          setSearchResultCount(data.count ?? results.length);
+          const matches = ids.size ? decisions.filter((decision) => ids.has(decision.id)) : [];
+          sortDecisions(matches, scoreMap);
+        })
+        .catch((error) => {
+          console.error('Erreur recherche sémantique:', error);
+          setActiveSearchIds(null);
+          setSearchScoreMap(new Map());
+          setSearchResultsSnapshot([]);
+          resetSemanticState();
+          applyFiltersAndSort();
+        })
+        .finally(finalize);
+      return;
+    }
+
+    const params = new URLSearchParams();
+    if (hasSearchTerm) {
+      params.append('keywords_or', searchTerm);
+      params.append('decision_number', searchTerm);
+    }
+    if (filters.keywordsInclusive) {
+      params.append('keywords_inc', filters.keywordsInclusive);
+    }
+    if (filters.keywordsOr) {
+      params.append('keywords_or', filters.keywordsOr);
+    }
+    if (filters.keywordsExclusive) {
+      params.append('keywords_exc', filters.keywordsExclusive);
+    }
+    if (filters.decisionNumber) {
+      params.append('decision_number', filters.decisionNumber);
+    }
+    if (filters.dateFrom) {
+      params.append('date_from', filters.dateFrom);
+    }
+    if (filters.dateTo) {
+      params.append('date_to', filters.dateTo);
+    }
+    params.append('language_scope', languageScope);
+    setActiveSearchIds(null);
+    setSearchScoreMap(new Map());
+    resetSemanticState();
+
+    fetch(`${COURSUPREME_API_URL}/search/advanced?${params.toString()}`)
+      .then((res) => res.json())
+      .then((data) => {
+        const results = data.results || [];
+        const ids = new Set(results.map((result) => result.id));
+        setSearchResultsSnapshot(results);
+        setActiveSearchIds(ids);
+        setSearchResultCount(data.count ?? ids.size);
+        const matches = ids.size ? decisions.filter((decision) => ids.has(decision.id)) : [];
+        sortDecisions(matches, new Map());
+      })
+      .catch((error) => {
+        console.error('Erreur recherche:', error);
+        setActiveSearchIds(null);
+        setSearchResultsSnapshot([]);
+        applyFiltersAndSort();
+      })
+      .finally(finalize);
+  };
+
+  const handleResetAndSearch = () => {
+    resetSearchCriteria();
+    setActiveSearchIds(null);
+    runSearch();
   };
 
   const handleSort = (field) => {
@@ -427,6 +777,46 @@ const DecisionStatusManager = () => {
     });
   };
 
+  const handleExportSelected = async () => {
+    const ids = Array.from(selectedDecisions);
+    if (!ids.length) {
+      showSelectionRequired();
+      return;
+    }
+    try {
+      const response = await fetch(exportEndpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({document_ids: ids})
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || 'Export impossible');
+      }
+      const blob = await response.blob();
+      const link = document.createElement('a');
+      const filename = `coursupreme-export-${Date.now()}.zip`;
+      link.href = URL.createObjectURL(blob);
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(link.href);
+      setConfirmModal({
+        isOpen: true,
+        type: 'success',
+        title: 'Export prêt',
+        message: `${ids.length} décision(s) exportée(s).\nLe fichier ZIP a été téléchargé.`,
+        confirmText: 'OK',
+        onConfirm: closeModal,
+        showCancel: false,
+        loading: false
+      });
+    } catch (error) {
+      alert(error.message || 'Erreur export');
+    }
+  };
+
   const handleViewDecision = async (id) => {
     try {
       const response = await fetch(`${COURSUPREME_API_URL}/decisions/${id}`);
@@ -473,114 +863,39 @@ const DecisionStatusManager = () => {
 
   return (
     <div className="p-6">
-      {/* Header avec recherche */}
       <div className="mb-6">
         <h2 className="text-2xl font-bold text-gray-800 mb-4">Gestion des Décisions</h2>
-
-        {/* Barre de recherche */}
-        <div className="bg-white rounded-lg shadow-sm border p-4 mb-4">
-          <div className="flex gap-2 mb-3">
-            <input
-              type="text"
-              placeholder="Recherche rapide..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="flex-1 border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-            <button
-              onClick={() => applyFiltersAndSort()}
-              className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all flex items-center gap-2"
-            >
-              <Search className="w-5 h-5" />
-              Rechercher
-            </button>
-            {(searchTerm || filters.keywordsInclusive || filters.keywordsExclusive || filters.decisionNumber || filters.dateFrom || filters.dateTo) && (
-              <button
-                onClick={() => {
-                  setSearchTerm('');
-                  setFilters({ keywordsInclusive: '', keywordsExclusive: '', decisionNumber: '', dateFrom: '', dateTo: '' });
-                }}
-                className="px-4 py-2 bg-gray-200 rounded-lg"
-              >
-                Effacer
-              </button>
-            )}
-          </div>
-
-          <button
-            onClick={() => setShowAdvancedSearch(!showAdvancedSearch)}
-            className="text-blue-600 hover:text-blue-800 text-sm font-medium"
-          >
-            {showAdvancedSearch ? '▼ Masquer recherche avancée' : '▶ Recherche avancée'}
-          </button>
-
-          {/* Recherche avancée */}
-          {showAdvancedSearch && (
-            <div className="bg-gray-50 rounded-lg p-4 space-y-3 mt-3">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Mots-clés inclusifs (ET)</label>
-                  <input
-                    type="text"
-                    placeholder="ex: مرور حادث"
-                    value={filters.keywordsInclusive}
-                    onChange={(e) => setFilters({ ...filters, keywordsInclusive: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Mots-clés exclusifs (NON)</label>
-                  <input
-                    type="text"
-                    placeholder="ex: استئناف"
-                    value={filters.keywordsExclusive}
-                    onChange={(e) => setFilters({ ...filters, keywordsExclusive: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-3 gap-3">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Numéro de décision</label>
-                  <input
-                    type="text"
-                    placeholder="ex: 00001"
-                    value={filters.decisionNumber}
-                    onChange={(e) => setFilters({ ...filters, decisionNumber: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Date début</label>
-                  <input
-                    type="date"
-                    value={filters.dateFrom}
-                    onChange={(e) => setFilters({ ...filters, dateFrom: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Date fin</label>
-                  <input
-                    type="date"
-                    value={filters.dateTo}
-                    onChange={(e) => setFilters({ ...filters, dateTo: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm"
-                  />
-                </div>
-              </div>
-
-              <button
-                onClick={() => applyFiltersAndSort()}
-                className="w-full py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
-              >
-                Rechercher avec filtres
-              </button>
-            </div>
-          )}
+        <CoursSupremeSearchPanel
+          searchTerm={searchTerm}
+          setSearchTerm={setSearchTerm}
+          onSearch={runSearch}
+          showAdvancedSearch={showAdvancedSearch}
+          setShowAdvancedSearch={setShowAdvancedSearch}
+          filters={filters}
+          setFilters={setFilters}
+          languageScope={languageScope}
+          setLanguageScope={setLanguageScope}
+          onAdvancedSearch={runSearch}
+          onReset={handleResetAndSearch}
+          isSearching={isSearching}
+          searchResultsCount={searchResultCount}
+          semanticLimit={semanticLimit}
+          setSemanticLimit={setSemanticLimit}
+          semanticThreshold={semanticThreshold}
+          setSemanticThreshold={setSemanticThreshold}
+        />
+        <div className="text-sm text-gray-500 mt-2">
+          Documents ramenés: {searchResultCount}
         </div>
-
+        {showSemanticStats && (
+          <div className="flex flex-wrap gap-4 text-xs text-gray-500 mt-2">
+            <span>Résultats sémantiques : {semanticStats.count}</span>
+            <span>Score min : {semanticStats.minScore ?? '—'}</span>
+            <span>Seuil : {semanticStats.scoreThreshold}</span>
+            <span>Limite renvoyée : {semanticStats.limit}</span>
+          </div>
+        )}
+      </div>
         {/* Actions groupées */}
         {selectedDecisions.size > 0 && (
           <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-lg p-4 shadow-sm">
@@ -621,11 +936,18 @@ const DecisionStatusManager = () => {
                   <span>🧬</span>
                   <span>Embeddings</span>
                 </button>
+                <button
+                  onClick={handleExportSelected}
+                  disabled={processing}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-all hover:scale-105 flex items-center gap-2 font-medium text-sm"
+                >
+                  <span>📦</span>
+                  <span>Exporter</span>
+                </button>
               </div>
             </div>
           </div>
         )}
-      </div>
 
       {/* Table des décisions */}
       <div className="bg-white rounded-lg shadow-sm border overflow-hidden">
@@ -635,7 +957,7 @@ const DecisionStatusManager = () => {
               <th className="p-3 text-left">
                 <input
                   type="checkbox"
-                  checked={selectedDecisions.size === filteredDecisions.length}
+                  checked={paginatedDecisions.length > 0 && paginatedDecisions.every(decision => selectedDecisions.has(decision.id))}
                   onChange={toggleSelectAll}
                   className="w-4 h-4"
                 />
@@ -670,7 +992,7 @@ const DecisionStatusManager = () => {
             </tr>
           </thead>
           <tbody>
-            {filteredDecisions.map((decision) => (
+            {paginatedDecisions.map((decision) => (
               <React.Fragment key={decision.id}>
                 <tr className="border-b hover:bg-gray-50">
                   <td className="p-3">
@@ -770,6 +1092,27 @@ const DecisionStatusManager = () => {
             ))}
           </tbody>
         </table>
+        <div className="flex items-center justify-between px-4 py-3 border-t bg-gray-50 text-xs">
+          <div>
+            Page {currentPage} / {totalPages}
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => handlePageChange('prev')}
+              disabled={currentPage <= 1}
+              className="px-3 py-1 border rounded disabled:opacity-50 text-gray-600"
+            >
+              ← Préc
+            </button>
+            <button
+              onClick={() => handlePageChange('next')}
+              disabled={currentPage >= totalPages}
+              className="px-3 py-1 border rounded disabled:opacity-50 text-gray-600"
+            >
+              Suiv →
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Confirmation Modal */}

@@ -59,10 +59,11 @@ L'application ne lit plus aucun fichier local. Pour servir les PDF/TXT :
    - `curl -I http://localhost:5001/api/joradp/documents/<id>/view` doit répondre `302` vers une URL `https://…r2.cloudflarestorage.com`.
    - Dans le front, l'ouverture d'un document Cour Suprême affiche toujours les contenus AR/FR (stream depuis R2).
 
-## 📦 Version 1.0
+## 📦 Version 1.1
 
-Date : 25 octobre 2025  
-Statut : ✅ Stable et fonctionnelle
+Date : 21 novembre 2025  
+Statut : ✅ Stable et fonctionnelle  
+Notes : Export Cours Suprême robuste (fallback R2) + confirmation côté UI. Voir `CHANGELOG.md`.
 
 ## 🚧 Roadmap V2
 

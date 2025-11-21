@@ -3,9 +3,11 @@ Flask-Cors
 requests
 beautifulsoup4
 sqlalchemy>=1.4,<3
+gunicorn
 anthropic
 pdfplumber==0.11.4
 PyPDF2
 selenium
 python-dotenv
 sentence-transformers
+boto3
