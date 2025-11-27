@@ -45,7 +45,7 @@ pip-delete-this-directory.txt
 AA/.git.backup
 BB/.git.backup
 BB/clé-API-Claude.rtf
-BB-old/clé-API-Claude.rtf
+backups/
 
 # Archives / bundles
 *.zip
