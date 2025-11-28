@@ -1,0 +1,37 @@
+CLONAGE MISSAN-V3 vers MIZANEDB - GUIDE SIMPLE
+==============================================
+
+ETAPE 1 : Installer la librairie Python (1 min)
+------------------------------------------------
+pip3 install supabase
+
+
+ETAPE 2 : Copier le schema SQL de Missan-V3 (2 min)
+----------------------------------------------------
+1. Allez sur https://supabase.com/dashboard
+2. Selectionnez Missan-V3
+3. SQL Editor
+4. Copiez cette requete et executez-la :
+
+SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('user_profiles','user_alerts','ai_usage_logs','alert_rules','client_conversations','clients','document_templates','email_templates','invoices','subscriptions','support_messages','system_settings','transactions');
+
+5. Notez les tables qui existent
+
+
+ETAPE 3 : Recreer les tables dans MizaneDb (3 min)
+---------------------------------------------------
+1. Allez sur MizaneDb dashboard
+2. Pour CHAQUE table de l'etape 2 :
+   - Cliquez sur la table dans Missan-V3
+   - Copiez la structure (colonnes + types)
+   - Recreez la meme table dans MizaneDb
+
+
+ETAPE 4 : Copier les donnees (5 min)
+-------------------------------------
+python3 migration/clone_donnees.py
+
+
+BESOIN D'AIDE ?
+---------------
+Le script Python vous guidera etape par etape !

@@ -11,7 +11,7 @@ from modules.coursupreme.routes import coursupreme_bp
 
 # Import des anciennes routes (harvest, sites, etc.)
 from collections_api import register_collections_routes
-from harvest_routes import register_harvest_routes
+from harvest_routes_pg import register_harvest_routes
 from sites_routes import register_sites_routes
 
 CWD = os.path.dirname(os.path.abspath(__file__))
