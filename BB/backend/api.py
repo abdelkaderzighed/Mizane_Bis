@@ -12,6 +12,7 @@ from modules.coursupreme.routes import coursupreme_bp
 # Import des anciennes routes (harvest, sites, etc.)
 from collections_api import register_collections_routes
 from harvest_routes_pg import register_harvest_routes
+from search_routes import register_search_routes
 from sites_routes import register_sites_routes
 
 CWD = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +32,7 @@ app.register_blueprint(coursupreme_bp, url_prefix='/api/coursupreme')
 # Anciennes routes (à garder pour l'instant)
 register_collections_routes(app)
 register_harvest_routes(app)
+register_search_routes(app)
 register_sites_routes(app)
 
 @app.route('/api/health', methods=['GET'])
