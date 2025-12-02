@@ -20,12 +20,7 @@ const CoursSupremeSearchPanel = ({
   onAdvancedSearch,
   onReset,
   searchResultsCount,
-  isSearching = false
-  ,
-  semanticLimit,
-  setSemanticLimit,
-  semanticThreshold,
-  setSemanticThreshold,
+  isSearching = false,
   availableChambers = [],
   availableThemes = [],
   resetCounter = 0
@@ -167,31 +162,6 @@ const CoursSupremeSearchPanel = ({
               : 'Aucun résultat calculé pour l’instant'}
           </span>
         </div>
-      </div>
-      <div className="flex flex-wrap gap-4 text-xs text-gray-500 mt-2">
-        <label className="flex flex-col text-gray-600">
-          Limite sémantique
-          <input
-            type="number"
-            min="1"
-            max="50"
-            value={semanticLimit}
-            onChange={(e) => setSemanticLimit(Math.min(50, Math.max(1, Number(e.target.value) || 1)))}
-            className="mt-1 w-24 border rounded px-2 py-1 text-xs"
-          />
-        </label>
-        <label className="flex flex-col text-gray-600">
-          Seuil minimal
-          <input
-            type="number"
-            step="0.01"
-            min="0"
-            max="1"
-            value={semanticThreshold}
-            onChange={(e) => setSemanticThreshold(Math.min(1, Math.max(0, Number(e.target.value) || 0)))}
-            className="mt-1 w-24 border rounded px-2 py-1 text-xs"
-          />
-        </label>
       </div>
 
       <button

@@ -10,7 +10,7 @@ interface CollapsibleFooterProps {
 
 export function CollapsibleFooter({ collapsed, onToggle }: CollapsibleFooterProps) {
   return (
-    <div className="border-t border-border bg-muted/20">
+    <div className="fixed bottom-0 left-0 right-0 border-t border-border bg-muted/90 backdrop-blur z-30">
       <div className="max-w-7xl mx-auto px-6 py-2 flex justify-center">
         <Button
           variant="ghost"

@@ -399,36 +399,70 @@ const HierarchicalView = () => {
     }
   };
 
-  const loadDocuments = async (sessionId, page = 1) => {
+  const loadDocuments = async (sessionId, page = 1, filtersOverride = null) => {
     try {
       setIsSearching(true);
-      const params = new URLSearchParams({
-        page,
-        per_page: 20,
-        ...(filters.year && {year: filters.year}),
-        ...(filters.dateDebut && {date_debut: filters.dateDebut}),
-        ...(filters.dateFin && {date_fin: filters.dateFin}),
-        ...(filters.status !== 'all' && {status: filters.status}),
-        ...(filters.searchNum && {search_num: filters.searchNum}),
-        ...(filters.keywordsTous && {keywords_tous: filters.keywordsTous}),
-        ...(filters.keywordsUnDe && {keywords_un_de: filters.keywordsUnDe}),
-        ...(filters.keywordsExclut && {keywords_exclut: filters.keywordsExclut}),
-        ...(filters.searchSemantique && {search_semantique: filters.searchSemantique})
-      });
-      
-      const res = await fetch(`${API_URL}/sessions/${sessionId}/documents?${params}`);
-      const data = await res.json();
-      
-      if (data.success) {
+      const f = filtersOverride || filters;
+      const hasSemantic = Boolean(f.searchSemantique && f.searchSemantique.trim());
+
+      if (hasSemantic) {
+        const params = new URLSearchParams({
+          q: f.searchSemantique.trim(),
+          limit: '0',
+          score_threshold: '0'
+        });
+        const res = await fetch(`${JORADP_API_URL}/search/semantic?${params.toString()}`);
+        const data = await res.json();
+        const results = (data.results || []).map((doc) => ({
+          id: doc.id,
+          url: doc.url,
+          file_path: doc.file_path_r2,
+          text_path: doc.text_path_r2,
+          date: doc.publication_date || '-',
+          numero: doc.id,
+          similarity: doc.score ?? null,
+          publication_date: doc.publication_date || '-',
+          statuts: { collected: true, downloaded: true, analyzed: true }
+        }));
         const normalizedData = {
-          ...data,
-          documents: (data.documents || []).map(doc => ({
-            ...doc,
-            statuts: normalizeDocStatuts(doc.statuts || {})
-          }))
+          success: true,
+          documents: results,
+          pagination: {
+            page: 1,
+            total_pages: 1,
+            total: results.length
+          }
         };
-        setSessionDocuments(prev => ({...prev, [sessionId]: normalizedData}));
-        setCurrentPage(prev => ({...prev, [sessionId]: page}));
+        setSessionDocuments((prev) => ({ ...prev, [sessionId]: normalizedData }));
+        setCurrentPage((prev) => ({ ...prev, [sessionId]: 1 }));
+      } else {
+        const params = new URLSearchParams({
+          page,
+          per_page: 20,
+          ...(f.year && {year: f.year}),
+          ...(f.dateDebut && {date_debut: f.dateDebut}),
+          ...(f.dateFin && {date_fin: f.dateFin}),
+          ...(f.status !== 'all' && {status: f.status}),
+          ...(f.searchNum && {search_num: f.searchNum}),
+          ...(f.keywordsTous && {keywords_tous: f.keywordsTous}),
+          ...(f.keywordsUnDe && {keywords_un_de: f.keywordsUnDe}),
+          ...(f.keywordsExclut && {keywords_exclut: f.keywordsExclut}),
+        });
+
+        const res = await fetch(`${API_URL}/sessions/${sessionId}/documents?${params}`);
+        const data = await res.json();
+
+        if (data.success) {
+          const normalizedData = {
+            ...data,
+            documents: (data.documents || []).map(doc => ({
+              ...doc,
+              statuts: normalizeDocStatuts(doc.statuts || {})
+            }))
+          };
+          setSessionDocuments(prev => ({...prev, [sessionId]: normalizedData}));
+          setCurrentPage(prev => ({...prev, [sessionId]: page}));
+        }
       }
     } catch (err) {
       console.error('❌ Erreur chargement documents:', err);
@@ -1005,12 +1039,18 @@ const HierarchicalView = () => {
                                 onClick={() => loadDocuments(session.id, 1)}
                                 disabled={isSearching}
                                 className={`px-4 py-1 rounded text-xs font-medium text-white ${isSearching ? 'bg-blue-300' : 'bg-blue-500 hover:bg-blue-600'}`}>
-                                {isSearching ? '⏳ Recherche...' : '🔍 Rechercher'}
+                                {isSearching ? (
+                                  <span className="flex items-center gap-1">
+                                    <span className="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full" />
+                                    Recherche...
+                                  </span>
+                                ) : '🔍 Rechercher'}
                               </button>
                               <button
                                 onClick={() => {
-                                  setFilters({year: '', dateDebut: '', dateFin: '', status: 'all', searchNum: '', keywordsTous: '', keywordsUnDe: '', keywordsExclut: '', searchSemantique: ''});
-                                  loadDocuments(session.id, 1);
+                                  const cleared = {year: '', dateDebut: '', dateFin: '', status: 'all', searchNum: '', keywordsTous: '', keywordsUnDe: '', keywordsExclut: '', searchSemantique: ''};
+                                  setFilters(cleared);
+                                  loadDocuments(session.id, 1, cleared);
                                 }}
                                 className="px-4 py-1 text-xs text-blue-600 hover:text-blue-800">
                                 ↻ Réinitialiser

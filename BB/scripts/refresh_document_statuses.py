@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Reconcilie les indicateurs `file_exists`/`text_exists` en base avec R2."""
+"""Reconcilie les statuts Download/Text des documents JORADP avec R2 (MizaneDb)."""
 
 from __future__ import annotations
 
 import argparse
-import sqlite3
-from typing import Iterable
-
 import sys
 from pathlib import Path
 
@@ -15,52 +12,66 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "backend"))
 
 from backend.modules.joradp import routes as joradp_routes
-
-
-def _iter_documents(conn: sqlite3.Connection) -> Iterable[sqlite3.Row]:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, file_path, text_path, file_exists, text_exists
-        FROM documents
-    """)
-    for row in cursor.fetchall():
-        yield row
+from backend.shared.postgres import get_connection as get_pg_connection
 
 
 def refresh_statuses(limit: int | None = None) -> tuple[int, int]:
-    conn = joradp_routes.get_db_connection()
-    try:
-        joradp_routes._ensure_documents_status_columns()
-    finally:
-        conn.close()
+    """Vérifie la présence réelle des fichiers R2 et ajuste les statuts Postgres."""
+    processed = 0
+    updated = 0
 
-    conn = joradp_routes.get_db_connection()
-    try:
-        processed = 0
-        updated = 0
-        for row in _iter_documents(conn):
+    with get_pg_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                id,
+                file_path_r2,
+                text_path_r2,
+                download_status,
+                text_extraction_status
+            FROM joradp_documents
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
+
+        for row in rows:
             if limit is not None and processed >= limit:
                 break
             processed += 1
 
-            current_file_exists = bool(row['file_exists'])
-            current_text_exists = bool(row['text_exists'])
+            file_exists = bool(row['file_path_r2']) and joradp_routes._r2_exists(row['file_path_r2'])
+            text_exists = bool(row['text_path_r2']) and joradp_routes._r2_exists(row['text_path_r2'])
 
-            joradp_routes._r2_exists.cache_clear()
+            updates = []
+            params = []
 
-            new_file_exists = bool(row['file_path']) and joradp_routes._r2_exists(row['file_path'])
-            new_text_exists = bool(row['text_path']) and joradp_routes._r2_exists(row['text_path'])
+            if file_exists and row['download_status'] != 'success':
+                updates.append("download_status = %s")
+                params.append('success')
+                updates.append("downloaded_at = COALESCE(downloaded_at, timezone('utc', now()))")
+            elif not file_exists and row['download_status'] == 'success':
+                updates.append("download_status = %s")
+                params.append('failed')
 
-            if new_file_exists != current_file_exists or new_text_exists != current_text_exists:
-                joradp_routes._update_document_exists_flags(
-                    row['id'],
-                    file_exists=new_file_exists,
-                    text_exists=new_text_exists,
+            if text_exists and row['text_extraction_status'] != 'success':
+                updates.append("text_extraction_status = %s")
+                params.append('success')
+                updates.append("text_extracted_at = COALESCE(text_extracted_at, timezone('utc', now()))")
+            elif not text_exists and row['text_extraction_status'] == 'success':
+                updates.append("text_extraction_status = %s")
+                params.append('failed')
+
+            if updates:
+                updates.append("error_log = NULL")
+                cur.execute(
+                    f"UPDATE joradp_documents SET {', '.join(updates)} WHERE id = %s",
+                    params + [row['id']],
                 )
                 updated += 1
-        return processed, updated
-    finally:
-        conn.close()
+
+        conn.commit()
+    return processed, updated
 
 
 def main() -> None:

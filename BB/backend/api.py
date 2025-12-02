@@ -13,7 +13,7 @@ from modules.coursupreme.routes import coursupreme_bp
 from collections_api import register_collections_routes
 from harvest_routes_pg import register_harvest_routes
 from search_routes import register_search_routes
-from sites_routes import register_sites_routes
+from sites_routes_pg import register_sites_routes
 
 CWD = os.path.dirname(os.path.abspath(__file__))
 # Charge d'abord l'éventuelle .env du dossier backend, puis celle à la racine si présente.

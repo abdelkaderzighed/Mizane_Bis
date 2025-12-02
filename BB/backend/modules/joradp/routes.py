@@ -1,14 +1,15 @@
 from __future__ import annotations
 from flask import Blueprint, jsonify, request, redirect, send_file
-import sqlite3
 import json
 import io
 import os
 import requests
 import time
 import zipfile
+from datetime import datetime, date
 from functools import lru_cache
 from requests.adapters import HTTPAdapter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from shared.r2_storage import (
     generate_presigned_url,
     build_public_url,
@@ -16,9 +17,12 @@ from shared.r2_storage import (
     delete_object as delete_r2_object,
     normalize_key,
 )
+from psycopg2.extras import Json
+from shared.postgres import get_connection as get_pg_connection
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 joradp_bp = Blueprint('joradp', __name__)
-DB_PATH = 'harvester.db'
 
 
 JORADP_R2_PREFIX = "Textes_juridiques_DZ/joradp.dz"
@@ -34,6 +38,93 @@ def _build_r2_session():
 
 
 _R2_SESSION = _build_r2_session()
+_EMBEDDING_MODEL = None
+_EMBED_CACHE = None
+
+
+def get_embedding_model():
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None:
+        _EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    return _EMBEDDING_MODEL
+
+
+def decode_embedding(blob: bytes | memoryview | None) -> np.ndarray | None:
+    if not blob:
+        return None
+    if isinstance(blob, memoryview):
+        blob = blob.tobytes()
+    arr = np.frombuffer(blob, dtype=np.float32)
+    return arr if arr.size else None
+
+
+def _download_embedding(url: str) -> bytes | None:
+    try:
+        resp = _R2_SESSION.get(url, timeout=20)
+        if resp.ok:
+            return resp.content
+    except Exception:
+        return None
+    return None
+
+
+def _build_embedding_url(raw_path: str | None) -> str | None:
+    if not raw_path:
+        return None
+    presigned = generate_presigned_url(raw_path)
+    if presigned:
+        return presigned
+    return build_public_url(raw_path)
+
+
+def _load_embeddings_cache():
+    global _EMBED_CACHE
+    if _EMBED_CACHE is not None:
+        return _EMBED_CACHE
+
+    cache = []
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, url, publication_date, file_path_r2, text_path_r2, embeddings_r2
+                FROM joradp_documents
+                WHERE embeddings_r2 IS NOT NULL
+                """
+            )
+            rows = cur.fetchall()
+
+    def worker(row):
+        emb_url = _build_embedding_url(row["embeddings_r2"])
+        if not emb_url:
+            return None
+        blob = _download_embedding(emb_url)
+        vec = decode_embedding(blob)
+        if vec is None or vec.size == 0:
+            return None
+        norm = np.linalg.norm(vec)
+        if norm == 0:
+            return None
+        vec = vec / norm  # pré-normalisation pour accélérer le scoring
+        return {
+            "id": row["id"],
+            "url": row["url"],
+            "publication_date": row["publication_date"],
+            "file_path_r2": row["file_path_r2"],
+            "text_path_r2": row["text_path_r2"],
+            "vector": vec,
+        }
+
+    # Téléchargement parallèle pour éviter une attente interminable sur la première requête.
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        futures = [executor.submit(worker, row) for row in rows]
+        for fut in as_completed(futures):
+            item = fut.result()
+            if item:
+                cache.append(item)
+
+    _EMBED_CACHE = cache
+    return _EMBED_CACHE
 
 
 def _extract_year_from_filename(filename: str) -> str:
@@ -52,6 +143,77 @@ def _build_text_key(pdf_key: str) -> str:
         return pdf_key[:-4] + ".txt"
     return f"{pdf_key}.txt"
 
+
+def _parse_date_string(value: str | None) -> date | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalize_keywords(value) -> list[str] | None:
+    if not value:
+        return None
+    if isinstance(value, list):
+        keywords = [str(item).strip() for item in value if str(item).strip()]
+        return keywords or None
+    if isinstance(value, str):
+        keywords = [token.strip() for token in value.replace(';', ',').split(',') if token.strip()]
+        return keywords or None
+    return None
+
+
+def _upsert_ai_metadata(cur, document_id: int, payload: dict) -> None:
+    keywords = payload.get('keywords')
+    entities = payload.get('entities')
+    dates_extracted = payload.get('dates_extracted')
+    extra_metadata = payload.get('extra_metadata')
+
+    cur.execute(
+        """
+        INSERT INTO document_ai_metadata (
+            document_id,
+            corpus,
+            language,
+            title,
+            publication_date,
+            summary,
+            keywords,
+            entities,
+            dates_extracted,
+            extra_metadata
+        )
+        VALUES (%s, 'joradp', %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (document_id, corpus, language)
+        DO UPDATE SET
+            title = EXCLUDED.title,
+            publication_date = EXCLUDED.publication_date,
+            summary = EXCLUDED.summary,
+            keywords = EXCLUDED.keywords,
+            entities = EXCLUDED.entities,
+            dates_extracted = EXCLUDED.dates_extracted,
+            extra_metadata = EXCLUDED.extra_metadata,
+            updated_at = timezone('utc', now())
+        """,
+        (
+            document_id,
+            payload.get('language') or 'fr',
+            payload.get('title'),
+            payload.get('publication_date'),
+            payload.get('summary'),
+            keywords,
+            Json(entities) if entities is not None else None,
+            Json(dates_extracted) if dates_extracted is not None else None,
+            Json(extra_metadata) if extra_metadata is not None else None,
+        ),
+    )
 
 def _ensure_public_url(raw_path: str | None) -> str | None:
     if not raw_path:
@@ -159,56 +321,21 @@ def _ensure_text_content(doc_id: int, file_path: str | None, text_path: str | No
     text_key = _build_text_key(pdf_key)
     uploaded_text_url = upload_bytes(text_key, extracted_text.encode('utf-8'), content_type='text/plain')
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE documents SET text_path = ?, text_extracted_at = CURRENT_TIMESTAMP WHERE id = ?", (uploaded_text_url, doc_id))
-    conn.commit()
-    conn.close()
-    _update_document_exists_flags(doc_id, text_exists=True)
+    with get_pg_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE joradp_documents
+            SET text_path_r2 = %s,
+                text_extraction_status = 'success',
+                text_extracted_at = timezone('utc', now()),
+                error_log = NULL
+            WHERE id = %s
+            """,
+            (uploaded_text_url, doc_id),
+        )
+        conn.commit()
 
     return extracted_text, uploaded_text_url
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def _ensure_documents_status_columns():
-    conn = get_db_connection()
-    try:
-        existing_columns = {row['name'] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
-        added = False
-        for column in ('file_exists', 'text_exists'):
-            if column not in existing_columns:
-                conn.execute(f"ALTER TABLE documents ADD COLUMN {column} INTEGER DEFAULT 0")
-                added = True
-        if added:
-            conn.commit()
-    finally:
-        conn.close()
-
-
-def _update_document_exists_flags(doc_id, file_exists=None, text_exists=None):
-    if file_exists is None and text_exists is None:
-        return
-    columns = []
-    params = []
-    if file_exists is not None:
-        columns.append("file_exists = ?")
-        params.append(1 if file_exists else 0)
-    if text_exists is not None:
-        columns.append("text_exists = ?")
-        params.append(1 if text_exists else 0)
-    params.append(doc_id)
-    conn = get_db_connection()
-    try:
-        conn.execute(f"UPDATE documents SET {', '.join(columns)} WHERE id = ?", params)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-_ensure_documents_status_columns()
 
 VALID_STATUS_VALUES = {'pending', 'in_progress', 'success', 'failed'}
 
@@ -264,92 +391,81 @@ def extract_num_from_url(url: str) -> str | None:
 
 @joradp_bp.route('/documents/<int:doc_id>/metadata', methods=['GET'])
 def get_document_metadata(doc_id):
-    """Récupérer les métadonnées d'un document"""
+    """Récupérer les métadonnées d'un document depuis MizaneDb."""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT
-                d.id,
-                d.url,
-                d.publication_date,
-                d.file_size_bytes,
-                d.file_path,
-                d.text_path,
-                d.metadata_collection_status,
-                d.download_status,
-                d.text_extraction_status,
-                d.ai_analysis_status,
-                d.embedding_status,
-                d.extra_metadata,
-                dm.title AS metadata_title,
-                dm.publication_date AS metadata_publication_date,
-                dm.language AS metadata_language,
-                dm.description AS metadata_description,
-                dm.page_count AS metadata_page_count,
-                ai.summary,
-                ai.keywords,
-                ai.named_entities,
-                ai.additional_metadata,
-                ai.extraction_quality,
-                ai.extraction_method,
-                ai.extraction_confidence,
-                ai.extracted_text_length,
-                ai.char_count,
-                ai.updated_at AS analysis_updated_at,
-                emb.model_name AS embedding_model,
-                emb.dimension AS embedding_dimension,
-                emb.created_at AS embedding_created_at,
-                LENGTH(emb.embedding) AS embedding_bytes
-            FROM documents d
-            LEFT JOIN document_ai_analysis ai ON d.id = ai.document_id
-            LEFT JOIN document_metadata dm ON d.id = dm.document_id
-            LEFT JOIN document_embeddings emb ON d.id = emb.document_id
-            WHERE d.id = ?
-        """, (doc_id,))
-        row = cursor.fetchone()
-        conn.close()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        d.id,
+                        d.url,
+                        d.publication_date,
+                        d.file_size_bytes,
+                        d.file_path_r2,
+                        d.text_path_r2,
+                        d.metadata_collection_status,
+                        d.download_status,
+                        d.text_extraction_status,
+                        d.ai_analysis_status,
+                        d.embedding_status,
+                        d.metadata_collected_at,
+                        d.downloaded_at,
+                        d.text_extracted_at,
+                        d.analyzed_at,
+                        d.embedded_at,
+                        d.error_log,
+                        jm.title AS metadata_title,
+                        jm.publication_date AS metadata_publication_date,
+                        jm.language AS metadata_language,
+                        jm.description AS metadata_description,
+                        jm.page_count AS metadata_page_count,
+                        ai.summary AS ai_summary,
+                        ai.keywords AS ai_keywords,
+                        ai.entities AS ai_entities,
+                        ai.dates_extracted AS ai_dates,
+                        ai.extra_metadata AS ai_extra,
+                        ai.language AS ai_language,
+                        ai.updated_at AS ai_updated_at
+                    FROM joradp_documents d
+                    LEFT JOIN joradp_metadata jm ON jm.document_id = d.id
+                    LEFT JOIN LATERAL (
+                        SELECT *
+                        FROM document_ai_metadata dam
+                        WHERE dam.document_id = d.id
+                          AND dam.corpus = 'joradp'
+                        ORDER BY CASE WHEN dam.language = 'fr' THEN 0 ELSE 1 END
+                        LIMIT 1
+                    ) ai ON TRUE
+                    WHERE d.id = %s
+                    """,
+                    (doc_id,),
+                )
+                row = cur.fetchone()
         if not row:
             return jsonify({'error': 'Document non trouvé'}), 404
-        doc = dict(row)
 
-        extra_metadata_raw = doc.pop('extra_metadata', None)
-        extra_metadata = None
-        if extra_metadata_raw:
+        analysis_metadata = row.get('ai_extra') or {}
+        if isinstance(analysis_metadata, str):
             try:
-                extra_metadata = json.loads(extra_metadata_raw)
-            except json.JSONDecodeError:
-                extra_metadata = None
-        if extra_metadata:
-            doc['extra_metadata'] = extra_metadata
-
-        analysis_metadata_raw = doc.pop('additional_metadata', None)
-        analysis_metadata = {}
-        if analysis_metadata_raw:
-            try:
-                analysis_metadata = json.loads(analysis_metadata_raw)
+                analysis_metadata = json.loads(analysis_metadata)
             except json.JSONDecodeError:
                 analysis_metadata = {}
 
-        file_exists = bool(doc.get('file_exists'))
-        text_exists = bool(doc.get('text_exists'))
+        file_exists = bool(row.get('file_path_r2'))
+        text_exists = bool(row.get('text_path_r2'))
 
-        doc['statuts'] = {
-            'collected': normalize_status(doc.pop('metadata_collection_status')),
-            'downloaded': reconcile_status_with_existence(doc.pop('download_status'), file_exists),
-            'text_extracted': reconcile_status_with_existence(doc.pop('text_extraction_status'), text_exists),
-            'analyzed': normalize_status(doc.pop('ai_analysis_status')),
-            'embedded': normalize_status(doc.pop('embedding_status')),
+        statuts = {
+            'collected': normalize_status(row.get('metadata_collection_status')),
+            'downloaded': reconcile_status_with_existence(row.get('download_status'), file_exists),
+            'text_extracted': reconcile_status_with_existence(row.get('text_extraction_status'), text_exists),
+            'analyzed': normalize_status(row.get('ai_analysis_status')),
+            'embedded': normalize_status(row.get('embedding_status')),
         }
 
-        # Informations enrichies
-        metadata_title = doc.pop('metadata_title', None)
+        metadata_title = row.get('metadata_title')
         ai_title = analysis_metadata.get('title') or analysis_metadata.get('document_title')
         ai_title_origin = analysis_metadata.get('title_origin')
-
-        title_origin = None
-        title_value = None
-
         if metadata_title:
             title_value = metadata_title
             title_origin = 'extracted'
@@ -359,115 +475,94 @@ def get_document_metadata(doc_id):
                 title_origin = ai_title_origin.lower()
             else:
                 title_origin = 'generated'
+        else:
+            title_value = None
+            title_origin = None
 
-        doc['title'] = title_value
-        doc['title_origin'] = title_origin
-
-        doc['document_language'] = doc.pop('metadata_language', None) or analysis_metadata.get('language')
-        doc['language'] = doc['document_language']
-        doc['document_page_count'] = doc.pop('metadata_page_count', None)
-
-        publication_meta = doc.pop('metadata_publication_date', None)
-        if publication_meta and not doc.get('publication_date'):
-            doc['publication_date'] = publication_meta
-        doc['metadata_publication_date'] = publication_meta
-
-        description_meta = doc.pop('metadata_description', None)
-        if description_meta:
-            doc['metadata_description'] = description_meta
-
-        # Analyse IA enrichie
-        summary = analysis_metadata.get('summary') or doc.get('summary')
+        summary = row.get('ai_summary') or analysis_metadata.get('summary')
         if isinstance(summary, dict):
             summary = summary.get('fr') or summary.get('en')
-        doc['summary'] = summary
 
-        keywords = analysis_metadata.get('keywords') or doc.get('keywords')
-        keywords_list = []
-        if isinstance(keywords, str):
-            keywords_list = [kw.strip() for kw in keywords.replace(';', ',').split(',') if kw.strip()]
-        elif isinstance(keywords, list):
-            keywords_list = [kw for kw in keywords if isinstance(kw, str) and kw.strip()]
-        elif isinstance(keywords, dict):
-            keywords_list = keywords.get('fr') or keywords.get('en') or []
-        doc['keywords'] = ', '.join(keywords_list)
-        doc['keywords_list'] = keywords_list
+        keywords_raw = row.get('ai_keywords') or analysis_metadata.get('keywords')
+        keywords_list: list[str] = []
+        if isinstance(keywords_raw, list):
+            keywords_list = [str(kw).strip() for kw in keywords_raw if str(kw).strip()]
+        elif isinstance(keywords_raw, dict):
+            base = keywords_raw.get('fr') or keywords_raw.get('en') or []
+            if isinstance(base, list):
+                keywords_list = [str(kw).strip() for kw in base if str(kw).strip()]
+        elif isinstance(keywords_raw, str):
+            keywords_list = [kw.strip() for kw in keywords_raw.replace(';', ',').split(',') if kw.strip()]
 
-        named_entities = analysis_metadata.get('entities') or analysis_metadata.get('named_entities') or doc.get('named_entities')
+        named_entities = row.get('ai_entities') or analysis_metadata.get('entities')
+        named_entities_list: list[str] | None = None
+        named_entities_str: str | None = None
         if isinstance(named_entities, list):
-            formatted_entities = []
+            named_entities_list = []
             for entity in named_entities:
                 if isinstance(entity, str):
-                    formatted_entities.append(entity)
+                    named_entities_list.append(entity)
                 elif isinstance(entity, dict):
                     etype = entity.get('type') or entity.get('label') or ''
                     value = entity.get('value') or entity.get('name') or ''
                     if etype or value:
-                        formatted_entities.append(f"{etype.upper() if etype else 'ENTITÉ'} - {value}".strip(' -'))
+                        named_entities_list.append(f"{etype.upper() if etype else 'ENTITÉ'} - {value}".strip(' -'))
                 else:
-                    formatted_entities.append(str(entity))
-            doc['named_entities'] = '\n'.join(formatted_entities)
-            doc['named_entities_list'] = formatted_entities
+                    named_entities_list.append(str(entity))
+            named_entities_str = '\n'.join(named_entities_list)
         elif isinstance(named_entities, dict):
-            flattened = []
+            named_entities_list = []
             for label, values in named_entities.items():
                 if isinstance(values, list):
-                    flattened.extend(f"{label}: {value}" for value in values)
-            doc['named_entities'] = '\n'.join(flattened)
-            doc['named_entities_list'] = flattened
-        else:
-            doc['named_entities'] = named_entities
+                    named_entities_list.extend(f"{label}: {value}" for value in values)
+            named_entities_str = '\n'.join(named_entities_list)
+        elif named_entities:
+            named_entities_str = str(named_entities)
 
-        doc['extraction_quality'] = doc.pop('extraction_quality', None) or analysis_metadata.get('extraction_quality')
-        doc['extraction_method'] = doc.pop('extraction_method', None) or analysis_metadata.get('extraction_method')
-        doc['extraction_confidence'] = doc.pop('extraction_confidence', None) or analysis_metadata.get('extraction_confidence')
-        doc['extracted_text_length'] = doc.pop('extracted_text_length', None) or analysis_metadata.get('extracted_text_length')
-        doc['text_char_count'] = doc.pop('char_count', None) or analysis_metadata.get('char_count')
-        doc['analysis_updated_at'] = doc.pop('analysis_updated_at', None)
-        doc['draft_date'] = analysis_metadata.get('draft_date') or analysis_metadata.get('document_date')
+        publication_date = row.get('publication_date') or row.get('metadata_publication_date')
+        doc = {
+            'id': row['id'],
+            'url': row['url'],
+            'publication_date': publication_date,
+            'file_size_bytes': row.get('file_size_bytes'),
+            'file_path': row.get('file_path_r2'),
+            'text_path': row.get('text_path_r2'),
+            'metadata_collected_at': row.get('metadata_collected_at'),
+            'downloaded_at': row.get('downloaded_at'),
+            'text_extracted_at': row.get('text_extracted_at'),
+            'analyzed_at': row.get('analyzed_at'),
+            'embedded_at': row.get('embedded_at'),
+            'statuts': statuts,
+            'title': title_value,
+            'title_origin': title_origin,
+            'document_language': row.get('metadata_language') or analysis_metadata.get('language') or row.get('ai_language'),
+            'language': row.get('metadata_language') or analysis_metadata.get('language') or row.get('ai_language'),
+            'document_page_count': row.get('metadata_page_count'),
+            'metadata_description': row.get('metadata_description'),
+            'summary': summary,
+            'keywords': ', '.join(keywords_list),
+            'keywords_list': keywords_list,
+            'named_entities': named_entities_str,
+            'named_entities_list': named_entities_list,
+            'dates_extracted': row.get('ai_dates'),
+            'analysis_updated_at': row.get('ai_updated_at'),
+            'draft_date': analysis_metadata.get('draft_date') or analysis_metadata.get('document_date'),
+            'numero': extract_num_from_url(row.get('url')),
+            'error_log': row.get('error_log'),
+        }
 
-        # Aperçu du texte
-        text_preview = None
         text_content = _fetch_r2_text(doc.get('text_path'))
         if text_content:
-            text_preview = text_content[:1500]
-        if text_preview:
-            doc['text_preview'] = text_preview
-            doc['text_preview_length'] = len(text_preview)
+            preview = text_content[:1500]
+            doc['text_preview'] = preview
+            doc['text_preview_length'] = len(preview)
 
-        # Informations embedding
-        embedding_info = None
-        extra_embedding = None
-        if extra_metadata:
-            extra_embedding = extra_metadata.get('embedding')
-        if extra_embedding:
-            embedding_info = {
-                'model': extra_embedding.get('model') or doc.get('embedding_model'),
-                'dimension': extra_embedding.get('dimension'),
-                'vector_length': len(extra_embedding.get('vector', [])) if isinstance(extra_embedding.get('vector'), list) else extra_embedding.get('dimension'),
-                'storage': 'extra_metadata'
-            }
-        elif doc.get('embedding_model'):
-            embedding_info = {
-                'model': doc.get('embedding_model'),
-                'dimension': doc.get('embedding_dimension'),
-                'bytes': doc.get('embedding_bytes'),
-                'created_at': doc.get('embedding_created_at'),
-                'storage': 'table'
-            }
-
-        # Nettoyer les champs temporaires
-        doc.pop('embedding_model', None)
-        doc.pop('embedding_dimension', None)
-        doc.pop('embedding_created_at', None)
-        doc.pop('embedding_bytes', None)
-
-        if embedding_info:
-            doc['embedding'] = embedding_info
-
-        doc['numero'] = extract_num_from_url(doc.get('url'))
-        if doc.get('publication_date') and not doc.get('date'):
-            doc['date'] = doc['publication_date']
+        doc['extra_metadata'] = {
+            'source': 'mizane_db',
+            'metadata_page_count': row.get('metadata_page_count'),
+            'metadata_description': row.get('metadata_description'),
+            'analysis_extra': analysis_metadata or None,
+        }
 
         return jsonify({'success': True, 'metadata': doc})
     except Exception as e:
@@ -478,122 +573,108 @@ def get_document_metadata(doc_id):
 def download_single_document(doc_id):
     """Télécharger un seul document PDF"""
     try:
-        # Récupérer le document de la BDD
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, url, file_path_r2, download_status
+                FROM joradp_documents
+                WHERE id = %s
+                """,
+                (doc_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Document non trouvé"}), 404
 
-        cursor.execute("""
-            SELECT id, url, file_path, download_status, file_exists
-            FROM documents
-            WHERE id = ?
-        """, (doc_id,))
+            already_exists = bool(row.get('file_path_r2'))
+            cur.execute(
+                """
+                UPDATE joradp_documents
+                SET download_status = 'in_progress',
+                    error_log = NULL
+                WHERE id = %s
+                """,
+                (doc_id,),
+            )
+            conn.commit()
 
-        doc = cursor.fetchone()
-        if not doc:
-            conn.close()
-            return jsonify({"error": "Document non trouvé"}), 404
-
-        file_exists = bool(doc.get('file_exists'))
-
-        # Marquer le téléchargement comme en cours
-        cursor.execute("""
-            UPDATE documents
-            SET download_status = 'in_progress',
-                error_log = NULL
-            WHERE id = ?
-        """, (doc_id,))
-        conn.commit()
-
-        # Télécharger le document
-        url = doc['url']
+        url = row["url"]
         response = requests.get(url, timeout=30)
         response.raise_for_status()
-
-        # Extraire le nom du fichier depuis l'URL
         filename = url.split('/')[-1]
-
         pdf_key = _build_pdf_key(filename)
         uploaded_url = upload_bytes(pdf_key, response.content, content_type='application/pdf')
 
-        # Mettre à jour la BDD
-        cursor.execute("""
-            UPDATE documents
-            SET file_path = ?,
-                download_status = 'success',
-                downloaded_at = CURRENT_TIMESTAMP,
-                file_size_bytes = ?
-            WHERE id = ?
-        """, (uploaded_url, len(response.content), doc_id))
-        _update_document_exists_flags(doc_id, file_exists=True)
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE joradp_documents
+                SET file_path_r2 = %s,
+                    download_status = 'success',
+                    downloaded_at = timezone('utc', now()),
+                    file_size_bytes = %s
+                WHERE id = %s
+                """,
+                (uploaded_url, len(response.content), doc_id),
+            )
+            conn.commit()
 
-        conn.commit()
-        conn.close()
-
-        return jsonify({
-            "success": True,
-            "message": "Document téléchargé avec succès",
-            "file_path": uploaded_url,
-            "file_exists_before": file_exists,
-            "overwritten": file_exists
-        })
+        return jsonify(
+            {
+                "success": True,
+                "message": "Document téléchargé avec succès",
+                "file_path": uploaded_url,
+                "file_exists_before": already_exists,
+                "overwritten": already_exists,
+            }
+        )
 
     except requests.RequestException as e:
-        try:
-            cursor.execute("""
-                UPDATE documents
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE joradp_documents
                 SET download_status = 'failed',
-                    error_log = ?
-                WHERE id = ?
-            """, (str(e), doc_id))
+                    error_log = %s
+                WHERE id = %s
+                """,
+                (str(e), doc_id),
+            )
             conn.commit()
-            conn.close()
-        except Exception:
-            pass
-        return jsonify({
-            "error": "Erreur de téléchargement",
-            "message": str(e)
-        }), 500
+        return jsonify({"error": "Erreur de téléchargement", "message": str(e)}), 500
     except Exception as e:
-        try:
-            cursor.execute("""
-                UPDATE documents
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE joradp_documents
                 SET download_status = 'failed',
-                    error_log = ?
-                WHERE id = ?
-            """, (str(e), doc_id))
+                    error_log = %s
+                WHERE id = %s
+                """,
+                (str(e), doc_id),
+            )
             conn.commit()
-            conn.close()
-        except Exception:
-            pass
-        return jsonify({
-            "error": "Erreur serveur",
-            "message": str(e)
-        }), 500
-
+        return jsonify({"error": "Erreur serveur", "message": str(e)}), 500
 
 @joradp_bp.route('/documents/<int:doc_id>/view', methods=['GET'])
 def view_document(doc_id):
     """Servir le fichier PDF pour visualisation"""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT file_path FROM documents WHERE id = ?", (doc_id,))
-        doc = cursor.fetchone()
-        conn.close()
-
-        if not doc or not doc['file_path']:
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT file_path_r2 FROM joradp_documents WHERE id = %s", (doc_id,))
+            doc = cur.fetchone()
+        if not doc or not doc['file_path_r2']:
             return jsonify({"error": "Document non trouvé ou pas encore téléchargé"}), 404
 
-        url = build_r2_url(doc['file_path'])
+        url = build_r2_url(doc['file_path_r2'])
 
         if not url:
             return jsonify({
                 "error": "URL R2 introuvable pour ce document",
-                "path": doc['file_path']
+                "path": doc['file_path_r2']
             }), 404
 
-        # Redirige vers l'URL R2 (le navigateur chargera le PDF directement).
+        # Redirige vers l’URL R2 (le navigateur chargera le PDF directement).
         return redirect(url, code=302)
 
     except Exception as e:
@@ -607,21 +688,21 @@ def view_document(doc_id):
 def delete_document(doc_id):
     """Supprimer un document de la base de données"""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_path_r2, text_path_r2 FROM joradp_documents WHERE id = %s",
+                (doc_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({'error': 'Document non trouvé'}), 404
 
-        cursor.execute('SELECT file_path, text_path FROM documents WHERE id = ?', (doc_id,))
-        doc = cursor.fetchone()
-        if not doc:
-            conn.close()
-            return jsonify({'error': 'Document non trouvé'}), 404
+            cur.execute("DELETE FROM document_ai_metadata WHERE document_id = %s AND corpus = 'joradp'", (doc_id,))
+            cur.execute("DELETE FROM joradp_documents WHERE id = %s", (doc_id,))
+            conn.commit()
 
-        cursor.execute('DELETE FROM documents WHERE id = ?', (doc_id,))
-        conn.commit()
-        conn.close()
-
-        delete_r2_object(doc['file_path'])
-        delete_r2_object(doc['text_path'])
+        delete_r2_object(row['file_path_r2'])
+        delete_r2_object(row['text_path_r2'])
 
         return jsonify({'success': True, 'message': 'Document supprimé'})
     except Exception as e:
@@ -634,91 +715,88 @@ def delete_document(doc_id):
 
 @joradp_bp.route('/sites', methods=['GET'])
 def get_sites():
-    """Liste tous les sites JORADP avec statistiques"""
+    """Liste tous les sites JORADP avec statistiques (MizaneDb)."""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Récupérer tous les sites
-        cursor.execute("""
-            SELECT
-                s.id,
-                s.name,
-                s.url,
-                s.created_at,
-                COUNT(DISTINCT hs.id) as nb_sessions,
-                COUNT(d.id) as nb_documents,
-                SUM(CASE WHEN hs.status = 'running' THEN 1 ELSE 0 END) as nb_running
-            FROM sites s
-            LEFT JOIN harvesting_sessions hs ON s.id = hs.site_id
-            LEFT JOIN documents d ON hs.id = d.session_id
-            GROUP BY s.id
-            ORDER BY s.created_at DESC
-        """)
-
-        sites = []
-        for row in cursor.fetchall():
-            sites.append({
-                'id': row['id'],
-                'name': row['name'],
-                'url': row['url'],
-                'created_at': row['created_at'],
-                'nb_sessions': row['nb_sessions'] or 0,
-                'nb_documents': row['nb_documents'] or 0,
-                'status': 'running' if row['nb_running'] > 0 else 'idle'
-            })
-
-        conn.close()
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.id,
+                    s.name,
+                    s.url,
+                    s.created_at,
+                    COUNT(DISTINCT hs.id) AS nb_sessions,
+                    COUNT(d.id) AS nb_documents,
+                    SUM(CASE WHEN hs.status = 'running' THEN 1 ELSE 0 END) AS nb_running
+                FROM sites s
+                LEFT JOIN harvesting_sessions hs ON s.id = hs.site_id
+                LEFT JOIN joradp_documents d ON hs.id = d.session_id
+                GROUP BY s.id
+                ORDER BY s.created_at DESC NULLS LAST
+                """
+            )
+            sites = []
+            for row in cur.fetchall():
+                sites.append(
+                    {
+                        'id': row['id'],
+                        'name': row['name'],
+                        'url': row['url'],
+                        'created_at': row['created_at'],
+                        'nb_sessions': row['nb_sessions'] or 0,
+                        'nb_documents': row['nb_documents'] or 0,
+                        'status': 'running' if (row['nb_running'] or 0) > 0 else 'idle',
+                    }
+                )
         return jsonify({'success': True, 'sites': sites})
-
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
 @joradp_bp.route('/sites/<int:site_id>/sessions', methods=['GET'])
 def get_site_sessions(site_id):
-    """Liste toutes les sessions d'un site"""
+    """Liste toutes les sessions d'un site (Postgres)."""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT
-                hs.id,
-                hs.session_name,
-                hs.status,
-                hs.current_phase,
-                hs.created_at,
-                COUNT(d.id) as nb_documents,
-                SUM(CASE WHEN d.metadata_collection_status = 'success' THEN 1 ELSE 0 END) as nb_collected,
-                SUM(CASE WHEN d.download_status = 'success' THEN 1 ELSE 0 END) as nb_downloaded,
-                SUM(CASE WHEN d.ai_analysis_status = 'success' THEN 1 ELSE 0 END) as nb_analyzed
-            FROM harvesting_sessions hs
-            LEFT JOIN documents d ON hs.id = d.session_id
-            WHERE hs.site_id = ?
-            GROUP BY hs.id
-            ORDER BY hs.created_at DESC
-        """, (site_id,))
-
-        sessions = []
-        for row in cursor.fetchall():
-            sessions.append({
-                'id': row['id'],
-                'session_name': row['session_name'],
-                'status': row['status'],
-                'current_phase': row['current_phase'],
-                'created_at': row['created_at'],
-                'nb_documents': row['nb_documents'] or 0,
-                'phases': {
-                    'collect': {'done': row['nb_collected'] or 0, 'total': row['nb_documents'] or 0},
-                    'download': {'done': row['nb_downloaded'] or 0, 'total': row['nb_documents'] or 0},
-                    'analyze': {'done': row['nb_analyzed'] or 0, 'total': row['nb_documents'] or 0}
-                }
-            })
-
-        conn.close()
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    hs.id,
+                    hs.session_name,
+                    hs.status,
+                    hs.current_phase,
+                    hs.created_at,
+                    COUNT(d.id) AS nb_documents,
+                    SUM(CASE WHEN d.metadata_collection_status = 'success' THEN 1 ELSE 0 END) AS nb_collected,
+                    SUM(CASE WHEN d.download_status = 'success' THEN 1 ELSE 0 END) AS nb_downloaded,
+                    SUM(CASE WHEN d.ai_analysis_status = 'success' THEN 1 ELSE 0 END) AS nb_analyzed
+                FROM harvesting_sessions hs
+                LEFT JOIN joradp_documents d ON hs.id = d.session_id
+                WHERE hs.site_id = %s
+                GROUP BY hs.id
+                ORDER BY hs.created_at DESC NULLS LAST
+                """,
+                (site_id,),
+            )
+            sessions = []
+            for row in cur.fetchall():
+                total_docs = row['nb_documents'] or 0
+                sessions.append(
+                    {
+                        'id': row['id'],
+                        'session_name': row['session_name'],
+                        'status': row['status'],
+                        'current_phase': row['current_phase'],
+                        'created_at': row['created_at'],
+                        'nb_documents': total_docs,
+                        'phases': {
+                            'collect': {'done': row['nb_collected'] or 0, 'total': total_docs},
+                            'download': {'done': row['nb_downloaded'] or 0, 'total': total_docs},
+                            'analyze': {'done': row['nb_analyzed'] or 0, 'total': total_docs},
+                        },
+                    }
+                )
         return jsonify({'success': True, 'sessions': sessions})
-
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -729,126 +807,127 @@ def get_site_sessions(site_id):
 
 @joradp_bp.route('/sessions/<int:session_id>/documents', methods=['GET'])
 def get_session_documents(session_id):
-    """Récupérer les documents d'une session avec pagination et filtres"""
+    """Récupérer les documents d'une session avec pagination et filtres (MizaneDb)."""
     try:
-        page = int(request.args.get('page', 1))
-        per_page = int(request.args.get('per_page', 50))
+        page = max(1, int(request.args.get('page', 1)))
+        per_page = min(200, int(request.args.get('per_page', 50)))
+        offset = (page - 1) * per_page
 
-        # Filtres optionnels
         year = request.args.get('year')
         date_debut = request.args.get('date_debut')
         date_fin = request.args.get('date_fin')
         status = request.args.get('status', 'all')
         search_num = request.args.get('search_num')
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Construire la requête avec filtres
-        where_clauses = ['session_id = ?']
+        where_clauses = ['d.session_id = %s']
         params = [session_id]
 
         if year:
-            # Chercher l'année dans l'URL (ex: F1973xxx.pdf)
-            where_clauses.append("url LIKE ?")
+            where_clauses.append("d.url ILIKE %s")
             params.append(f'%F{year}%')
-
         if date_debut:
-            where_clauses.append('publication_date >= ?')
+            where_clauses.append('d.publication_date >= %s')
             params.append(date_debut)
-
         if date_fin:
-            where_clauses.append('publication_date <= ?')
+            where_clauses.append('d.publication_date <= %s')
             params.append(date_fin)
-
         if status != 'all':
-            if status == 'collected':
-                where_clauses.append("metadata_collection_status = 'success'")
-            elif status == 'downloaded':
-                where_clauses.append("download_status = 'success'")
-            elif status == 'analyzed':
-                where_clauses.append("ai_analysis_status = 'success'")
-
+            mapping = {
+                'collected': 'd.metadata_collection_status',
+                'downloaded': 'd.download_status',
+                'text': 'd.text_extraction_status',
+                'analyzed': 'd.ai_analysis_status',
+                'embedded': 'd.embedding_status',
+            }
+            column = mapping.get(status)
+            if column:
+                where_clauses.append(f"{column} = 'success'")
         if search_num:
-            where_clauses.append('url LIKE ?')
+            where_clauses.append('d.url ILIKE %s')
             params.append(f'%{search_num}%')
 
         where_sql = ' AND '.join(where_clauses)
 
-        # Compter le total
-        cursor.execute(f'SELECT COUNT(*) FROM documents WHERE {where_sql}', params)
-        total = cursor.fetchone()[0]
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) AS total FROM joradp_documents d WHERE {where_sql}", params)
+            total = cur.fetchone()['total']
 
-        # Récupérer la page
-        offset = (page - 1) * per_page
-        cursor.execute(f"""
-            SELECT
-                id,
-                url,
-                publication_date,
-                file_size_bytes,
-                metadata_collection_status,
-                download_status,
-                text_extraction_status,
-                ai_analysis_status,
-                embedding_status,
-                file_path,
-                text_path,
-                file_exists,
-                text_exists
-            FROM documents
-            WHERE {where_sql}
-            ORDER BY publication_date DESC, url DESC
-            LIMIT ? OFFSET ?
-        """, params + [per_page, offset])
+            cur.execute(
+                f"""
+                SELECT
+                    d.id,
+                    d.url,
+                    d.publication_date,
+                    d.file_size_bytes,
+                    d.metadata_collection_status,
+                    d.download_status,
+                    d.text_extraction_status,
+                    d.ai_analysis_status,
+                    d.embedding_status,
+                    d.file_path_r2,
+                    d.text_path_r2,
+                    d.metadata_collected_at,
+                    d.downloaded_at,
+                    d.text_extracted_at,
+                    d.analyzed_at,
+                    d.embedded_at
+                FROM joradp_documents d
+                WHERE {where_sql}
+                ORDER BY COALESCE(d.publication_date, d.created_at) DESC, d.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                params + [per_page, offset],
+            )
+            rows = cur.fetchall()
 
         documents = []
-        for row in cursor.fetchall():
-            # Extraire le numéro depuis l'URL
-            filename = row['url'].split('/')[-1]  # F2024001.pdf
-            num = filename[5:8] if len(filename) > 8 else '000'
+        for row in rows:
+            url = row['url'] or ''
+            filename = url.split('/')[-1]
+            numero = filename[5:8] if len(filename) >= 8 else ''
+            year_str = None
+            if len(filename) >= 8 and filename.startswith('F') and filename[1:5].isdigit():
+                year_str = filename[1:5]
 
-            # Extraire l'année de l'URL (ex: F1973001.pdf -> 1973)
-            import re
-            year_match = re.search(r'F(\d{4})\d{3}\.pdf', row['url'])
-            year_str = year_match.group(1) if year_match else None
-
-            file_exists = bool(row['file_exists'])
-            text_exists = bool(row['text_exists'])
-
-            documents.append({
-                'id': row['id'],
-                'url': row['url'],
-                'numero': num,
-                'date': year_str,  # Année extraite de l'URL
-                'publication_date': row['publication_date'],
-                'size_kb': round(row['file_size_bytes'] / 1024, 1) if row['file_size_bytes'] else 0,
-                'file_path': row['file_path'],
-                'text_path': row['text_path'],
-                'file_exists': file_exists,
-                'text_exists': text_exists,
-                'statuts': {
-                    'collected': normalize_status(row['metadata_collection_status']),
-                    'downloaded': reconcile_status_with_existence(row['download_status'], file_exists),
-                    'text_extracted': reconcile_status_with_existence(row['text_extraction_status'], text_exists),
-                    'analyzed': normalize_status(row['ai_analysis_status']),
-                    'embedded': normalize_status(row['embedding_status'])
+            file_exists = bool(row['file_path_r2'])
+            text_exists = bool(row['text_path_r2'])
+            documents.append(
+                {
+                    'id': row['id'],
+                    'url': row['url'],
+                    'numero': numero,
+                    'date': year_str,
+                    'publication_date': row['publication_date'],
+                    'size_kb': round((row['file_size_bytes'] or 0) / 1024, 1) if row['file_size_bytes'] else 0,
+                    'file_path': row['file_path_r2'],
+                    'text_path': row['text_path_r2'],
+                    'file_exists': file_exists,
+                    'text_exists': text_exists,
+                    'metadata_collected_at': row.get('metadata_collected_at'),
+                    'downloaded_at': row.get('downloaded_at'),
+                    'text_extracted_at': row.get('text_extracted_at'),
+                    'analyzed_at': row.get('analyzed_at'),
+                    'embedded_at': row.get('embedded_at'),
+                    'statuts': {
+                        'collected': normalize_status(row['metadata_collection_status']),
+                        'downloaded': reconcile_status_with_existence(row['download_status'], file_exists),
+                        'text_extracted': reconcile_status_with_existence(row['text_extraction_status'], text_exists),
+                        'analyzed': normalize_status(row['ai_analysis_status']),
+                        'embedded': normalize_status(row['embedding_status']),
+                    },
                 }
-            })
+            )
 
-        conn.close()
-
-        return jsonify({
-            'success': True,
-            'documents': documents,
-            'pagination': {
+        return jsonify(
+            success=True,
+            documents=documents,
+            pagination={
                 'page': page,
                 'per_page': per_page,
                 'total': total,
-                'total_pages': (total + per_page - 1) // per_page
-            }
-        })
-
+                'total_pages': (total + per_page - 1) // per_page,
+            },
+        )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -856,23 +935,17 @@ def get_session_documents(session_id):
 @joradp_bp.route('/sessions/delete', methods=['POST'])
 def delete_sessions():
     """Supprimer plusieurs sessions (bulk)"""
-    data = request.json
+    data = request.json or {}
     session_ids = data.get('session_ids', [])
 
     if not session_ids:
         return jsonify({'error': 'session_ids requis'}), 400
 
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        placeholders = ','.join('?' * len(session_ids))
-        cursor.execute(f"DELETE FROM harvesting_sessions WHERE id IN ({placeholders})", session_ids)
-
-        deleted = cursor.rowcount
-        conn.commit()
-        conn.close()
-
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM harvesting_sessions WHERE id = ANY(%s)", (session_ids,))
+            deleted = cur.rowcount
+            conn.commit()
         return jsonify({'success': True, 'deleted': deleted})
 
     except Exception as e:
@@ -886,31 +959,28 @@ def download_documents_batch(session_id):
         data = request.json or {}
         mode = data.get('mode', 'all')
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Construire la requête selon le mode
-        where_clauses = ['session_id = ?', "(download_status = 'pending' OR download_status = 'failed')"]
+        where_clauses = ["d.session_id = %s", "(d.download_status = 'pending' OR d.download_status = 'failed')"]
         params = [session_id]
 
         if mode == 'selected':
             doc_ids = data.get('document_ids', [])
             if not doc_ids:
                 return jsonify({'error': 'Aucun document sélectionné'}), 400
-            placeholders = ','.join('?' * len(doc_ids))
-            where_clauses.append(f'id IN ({placeholders})')
-            params.extend(doc_ids)
+            where_clauses.append("d.id = ANY(%s)")
+            params.append(doc_ids)
 
-        where_sql = ' AND '.join(where_clauses)
+        where_sql = " AND ".join(where_clauses)
 
-        cursor.execute(f"""
-            SELECT id, url, file_path
-            FROM documents
-            WHERE {where_sql}
-        """, params)
-
-        documents = cursor.fetchall()
-        conn.close()
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT d.id, d.url
+                FROM joradp_documents d
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            )
+            documents = cur.fetchall()
 
         if not documents:
             return jsonify({
@@ -918,9 +988,6 @@ def download_documents_batch(session_id):
                 'message': 'Aucun document à télécharger',
                 'downloaded': 0
             })
-
-        # Télécharger chaque document
-        import requests
 
         success_count = 0
         failed_count = 0
@@ -930,45 +997,40 @@ def download_documents_batch(session_id):
             url = doc['url']
 
             try:
-                # Télécharger le PDF
                 response = requests.get(url, timeout=30)
                 response.raise_for_status()
-
                 filename = url.split('/')[-1]
                 pdf_key = _build_pdf_key(filename)
                 uploaded_url = upload_bytes(pdf_key, response.content, content_type='application/pdf')
 
-                # Mettre à jour la BD
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE documents
-                    SET download_status = 'success',
-                        downloaded_at = CURRENT_TIMESTAMP,
-                        file_path = ?,
-                        file_size_bytes = ?
-                    WHERE id = ?
-                """, (uploaded_url, len(response.content), doc_id))
-                conn.commit()
-                conn.close()
-
+                with get_pg_connection() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE joradp_documents
+                        SET download_status = 'success',
+                            downloaded_at = timezone('utc', now()),
+                            file_path_r2 = %s,
+                            file_size_bytes = %s
+                        WHERE id = %s
+                        """,
+                        (uploaded_url, len(response.content), doc_id),
+                    )
+                    conn.commit()
                 success_count += 1
-                print(f"✅ Téléchargé: {filename}")
 
             except Exception as e:
-                # Marquer comme failed
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE documents
-                    SET download_status = 'failed', error_log = ?
-                    WHERE id = ?
-                """, (str(e), doc_id))
-                conn.commit()
-                conn.close()
-
+                with get_pg_connection() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE joradp_documents
+                        SET download_status = 'failed',
+                            error_log = %s
+                        WHERE id = %s
+                        """,
+                        (str(e), doc_id),
+                    )
+                    conn.commit()
                 failed_count += 1
-                print(f"❌ Échec: {url} - {e}")
 
         return jsonify({
             'success': True,
@@ -1002,21 +1064,18 @@ def export_selected_documents():
         if not numeric_ids:
             return jsonify({'error': 'document_ids invalides'}), 400
 
-        placeholders = ','.join('?' * len(numeric_ids))
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            SELECT id, url, file_path
-            FROM documents
-            WHERE id IN ({placeholders})
-              AND file_path IS NOT NULL
-              AND download_status = 'success'
-            """,
-            numeric_ids
-        )
-        docs = cursor.fetchall()
-        conn.close()
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, url, file_path_r2
+                FROM joradp_documents
+                WHERE id = ANY(%s)
+                  AND file_path_r2 IS NOT NULL
+                  AND download_status = 'success'
+                """,
+                (numeric_ids,),
+            )
+            docs = cur.fetchall()
 
         if not docs:
             return jsonify({'error': 'Aucun PDF disponible pour les IDs fournis'}), 404
@@ -1025,7 +1084,7 @@ def export_selected_documents():
         added = 0
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
             for row in docs:
-                raw_url = row['file_path']
+                raw_url = row['file_path_r2']
                 if not raw_url:
                     continue
                 signed = generate_presigned_url(raw_url, expires_in=600) or build_public_url(raw_url)
@@ -1057,150 +1116,47 @@ def export_selected_documents():
 
 @joradp_bp.route('/sessions/<int:session_id>/analyze', methods=['POST'])
 def analyze_documents_batch(session_id):
-    """Analyser les documents avec OpenAI IA"""
+    """Analyser les documents d'une session avec OpenAI IA (MizaneDb)."""
     try:
         from openai import OpenAI
         from analysis import get_embedding_model
 
-        # Charger la clé API
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             return jsonify({'error': 'OPENAI_API_KEY non trouvée'}), 500
 
-        client = OpenAI(api_key=api_key)
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Récupérer les documents téléchargés mais pas encore analysés
-        cursor.execute("""
-            SELECT id, file_path, text_path, url
-            FROM documents
-            WHERE session_id = ?
-            AND download_status = 'success'
-            AND (ai_analysis_status = 'pending' OR ai_analysis_status = 'failed')
-        """, (session_id,))
-
-        documents = cursor.fetchall()
-        conn.close()
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    url,
+                    publication_date,
+                    file_path_r2,
+                    text_path_r2,
+                    ai_analysis_status,
+                    embedding_status
+                FROM joradp_documents
+                WHERE session_id = %s
+                  AND download_status = 'success'
+                  AND ai_analysis_status IN ('pending', 'failed')
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            )
+            documents = cur.fetchall()
 
         if not documents:
-            return jsonify({
-                'success': True,
-                'message': 'Aucun document à analyser',
-                'analyzed': 0
-            })
+            return jsonify({'success': True, 'message': 'Aucun document à analyser', 'analyzed': 0})
 
-        success_count = 0
-        failed_count = 0
-
-        for doc in documents:
-            doc_id = doc['id']
-            file_path = doc['file_path']
-            text_path = doc['text_path']
-            url = doc['url']
-
-            try:
-                text, _ = _ensure_text_content(doc_id, file_path, text_path, url)
-
-                # 1.5. Générer l'embedding du texte
-                embedding_model = get_embedding_model()
-                embedding_data = None
-
-                if embedding_model:
-                    try:
-                        vector = embedding_model.encode(
-                            text[:5000],  # Limiter pour l'embedding
-                            convert_to_numpy=True,
-                            normalize_embeddings=True
-                        )
-                        if hasattr(vector, 'tolist'):
-                            vector = vector.tolist()
-
-                        embedding_data = {
-                            'model': 'all-MiniLM-L6-v2',
-                            'dimension': len(vector),
-                            'vector': [float(v) for v in vector]
-                        }
-                    except Exception as e:
-                        print(f"   ⚠️  Embedding non généré: {e}")
-
-                # 2. Analyser avec OpenAI
-                text_sample = text[:10000]
-
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    max_tokens=1024,
-                    messages=[{
-                        "role": "user",
-                        "content": f"""Analyse ce document juridique officiel et retourne un JSON strict avec les clés EXACTES suivantes :
-- \"title\" : un titre clair et informatif (génère-le si le texte n'en contient pas).
-- \"summary\" : résumé synthétique en français (2 à 4 phrases).
-- \"keywords\" : tableau (max 5) de mots-clés pertinents (chaque valeur est une chaîne).
-- \"entities\" : tableau décrivant les entités nommées majeures, chaque entrée au format \"TYPE - Nom\" (TYPE ∈ {{PERSONNE, ORGANISATION, LIEU, DATE, AUTRE}}).
-- \"draft_date\" : date de rédaction au format YYYY-MM-DD ou null si inconnue.
-Si une information est introuvable, utilise null ou une chaîne vide.
-
-Document :
-{text_sample}"""
-                    }],
-                    response_format={"type": "json_object"}
-                )
-
-                analysis_result = response.choices[0].message.content
-
-                # 3. Sauvegarder dans la BD
-                conn = get_db_connection()
-                cursor = conn.cursor()
-
-                # Sauvegarder l'embedding si généré
-                if embedding_data:
-                    cursor.execute(
-                        "UPDATE documents SET extra_metadata = ? WHERE id = ?",
-                        (json.dumps({'embedding': embedding_data}), doc_id)
-                    )
-
-                # Mettre à jour le document
-                cursor.execute("""
-                    UPDATE documents
-                    SET ai_analysis_status = 'success', analyzed_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                """, (doc_id,))
-
-                # Insérer ou mettre à jour l'analyse
-                cursor.execute("""
-                    INSERT OR REPLACE INTO document_ai_analysis
-                    (document_id, extracted_text_length, summary, additional_metadata, created_at)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """, (doc_id, len(text), analysis_result[:500], analysis_result))
-
-                conn.commit()
-                conn.close()
-
-                success_count += 1
-                print(f"✅ Analysé: {os.path.basename(file_path)}")
-
-            except Exception as e:
-                # Marquer comme failed
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE documents
-                    SET ai_analysis_status = 'failed', error_log = ?
-                    WHERE id = ?
-                """, (str(e), doc_id))
-                conn.commit()
-                conn.close()
-
-                failed_count += 1
-                print(f"❌ Échec analyse: {url} - {e}")
-
-        return jsonify({
-            'success': True,
-            'analyzed': success_count,
-            'failed': failed_count,
-            'total': len(documents)
-        })
+        result = _run_ai_analysis(
+            documents,
+            client=OpenAI(api_key=api_key),
+            embedding_model=get_embedding_model(),
+            force=True,
+            generate_embeddings=True,
+        )
+        return jsonify(result)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1267,216 +1223,34 @@ def incremental_harvest():
 
 @joradp_bp.route('/documents/extraction-quality', methods=['GET'])
 def get_extraction_quality_stats():
-    """Obtenir les statistiques de qualité d'extraction"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Stats par qualité
-        cursor.execute("""
-            SELECT
-                COALESCE(extraction_quality, 'unknown') as quality,
-                COUNT(*) as count
-            FROM document_ai_analysis
-            GROUP BY extraction_quality
-        """)
-        quality_stats = {row['quality']: row['count'] for row in cursor.fetchall()}
-
-        # Stats par méthode
-        cursor.execute("""
-            SELECT
-                COALESCE(extraction_method, 'pypdf2') as method,
-                COUNT(*) as count
-            FROM document_ai_analysis
-            GROUP BY extraction_method
-        """)
-        method_stats = {row['method']: row['count'] for row in cursor.fetchall()}
-
-        # Documents à ré-extraire (poor/failed/unknown)
-        cursor.execute("""
-            SELECT COUNT(*) as count
-            FROM documents d
-            LEFT JOIN document_ai_analysis da ON d.id = da.document_id
-            WHERE d.file_path IS NOT NULL
-            AND d.file_path LIKE '%.pdf'
-            AND (da.extraction_quality IS NULL
-                 OR da.extraction_quality IN ('poor', 'failed', 'unknown'))
-        """)
-        reextract_count = cursor.fetchone()['count']
-
-        conn.close()
-
-        return jsonify({
-            'quality_stats': quality_stats,
-            'method_stats': method_stats,
-            'needs_reextraction': reextract_count
-        })
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """Route conservée pour compatibilité mais non implémentée après migration."""
+    return jsonify({
+        'error': 'Statistiques de qualité non disponibles depuis la migration MizaneDb'
+    }), 410
 
 
 @joradp_bp.route('/documents/poor-quality', methods=['GET'])
 def get_poor_quality_documents():
-    """Lister les documents avec qualité poor/failed/unknown"""
-    try:
-        from shared.intelligent_text_extractor import IntelligentTextExtractor
-
-        extractor = IntelligentTextExtractor(DB_PATH)
-        docs = extractor.get_poor_quality_documents()
-
-        return jsonify({
-            'count': len(docs),
-            'documents': docs
-        })
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """Route conservée pour compatibilité mais non implémentée après migration."""
+    return jsonify({
+        'error': 'Inspection détaillée non disponible. Utilisez les statuts MizaneDb.'
+    }), 410
 
 
 @joradp_bp.route('/documents/reextract', methods=['POST'])
 def reextract_documents():
-    """
-    Ré-extraire les documents avec qualité insuffisante
-
-    Body JSON:
-    {
-        "document_ids": [1, 2, 3],  # Optionnel, sinon tous les poor/failed
-        "use_vision_api": false,    # Activer Vision API pour derniers recours
-        "force": false              # Forcer même si déjà good/excellent
-    }
-    """
-    try:
-        from shared.intelligent_text_extractor import IntelligentTextExtractor
-
-        data = request.json or {}
-        document_ids = data.get('document_ids', [])
-        use_vision = data.get('use_vision_api', False)
-        force = data.get('force', False)
-
-        # Activer Vision API si demandé
-        if use_vision:
-            os.environ['ENABLE_VISION_API'] = 'true'
-
-        extractor = IntelligentTextExtractor(DB_PATH)
-
-        # Si IDs spécifiés, les utiliser
-        if document_ids:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-
-            placeholders = ','.join('?' * len(document_ids))
-            cursor.execute(f"""
-                SELECT d.id, d.file_path
-                FROM documents d
-                WHERE d.id IN ({placeholders})
-                AND d.file_path IS NOT NULL
-                AND d.file_path LIKE '%.pdf'
-            """, document_ids)
-
-            docs = [{'id': row['id'], 'file_path': row['file_path']}
-                    for row in cursor.fetchall()]
-            conn.close()
-        else:
-            # Sinon, récupérer tous les documents de qualité insuffisante
-            docs = extractor.get_poor_quality_documents()
-
-        # Ré-extraire
-        results = []
-        total = len(docs)
-
-        print(f"\n🔄 Ré-extraction de {total} documents...")
-
-        for i, doc in enumerate(docs):
-            print(f"\n📄 [{i+1}/{total}] Document {doc['id']}...")
-
-            try:
-                result = extractor.extract_and_evaluate(doc['file_path'], doc['id'])
-
-                results.append({
-                    'id': doc['id'],
-                    'success': True,
-                    'quality': result['quality'],
-                    'method': result['method'],
-                    'confidence': result['confidence'],
-                    'char_count': result['char_count']
-                })
-
-            except Exception as e:
-                print(f"❌ Erreur document {doc['id']}: {e}")
-                results.append({
-                    'id': doc['id'],
-                    'success': False,
-                    'error': str(e)
-                })
-
-        # Statistiques finales
-        successful = sum(1 for r in results if r.get('success'))
-        excellent = sum(1 for r in results if r.get('quality') == 'excellent')
-        good = sum(1 for r in results if r.get('quality') == 'good')
-        poor = sum(1 for r in results if r.get('quality') == 'poor')
-        failed = sum(1 for r in results if r.get('quality') == 'failed')
-
-        return jsonify({
-            'total_processed': total,
-            'successful': successful,
-            'stats': {
-                'excellent': excellent,
-                'good': good,
-                'poor': poor,
-                'failed': failed
-            },
-            'results': results
-        })
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """Route conservée pour compatibilité mais non implémentée après migration."""
+    return jsonify({
+        'error': 'La ré-extraction passe désormais par /batch/extract (MizaneDb).'
+    }), 410
 
 
 @joradp_bp.route('/documents/<int:doc_id>/reextract', methods=['POST'])
 def reextract_single_document(doc_id):
-    """Ré-extraire un seul document"""
-    try:
-        from shared.intelligent_text_extractor import IntelligentTextExtractor
-
-        data = request.json or {}
-        use_vision = data.get('use_vision_api', False)
-
-        # Activer Vision API si demandé
-        if use_vision:
-            os.environ['ENABLE_VISION_API'] = 'true'
-
-        # Récupérer le document
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT file_path
-            FROM documents
-            WHERE id = ?
-            AND file_path IS NOT NULL
-            AND file_path LIKE '%.pdf'
-        """, (doc_id,))
-
-        doc = cursor.fetchone()
-        conn.close()
-
-        if not doc:
-            return jsonify({'error': 'Document non trouvé ou pas de PDF'}), 404
-
-        # Extraire
-        extractor = IntelligentTextExtractor(DB_PATH)
-        result = extractor.extract_and_evaluate(doc['file_path'], doc_id)
-
-        return jsonify({
-            'document_id': doc_id,
-            'quality': result['quality'],
-            'method': result['method'],
-            'confidence': result['confidence'],
-            'char_count': result['char_count']
-        })
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """Route conservée pour compatibilité mais non implémentée après migration."""
+    return jsonify({
+        'error': 'Utilisez les nouvelles routes de batch extraction.'
+    }), 410
 
 
 # ============================================================================
@@ -1485,71 +1259,110 @@ def reextract_single_document(doc_id):
 
 @joradp_bp.route('/stats', methods=['GET'])
 def get_global_stats():
-    """Récupérer les statistiques globales pour JORADP"""
+    """Récupérer les statistiques globales pour JORADP depuis MizaneDb."""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS total FROM joradp_documents")
+                total = cur.fetchone()['total']
 
-        # Total de documents
-        cursor.execute("SELECT COUNT(*) as total FROM documents")
-        total = cursor.fetchone()['total']
+                def count_with_status(column: str) -> int:
+                    cur.execute(
+                        f"SELECT COUNT(*) AS count FROM joradp_documents WHERE {column} = 'success'"
+                    )
+                    return cur.fetchone()['count']
 
-        # Documents collectés (métadonnées)
-        cursor.execute("""
-            SELECT COUNT(*) as collected
-            FROM documents
-            WHERE metadata_collection_status = 'success'
-        """)
-        collected = cursor.fetchone()['collected']
+                collected = count_with_status("metadata_collection_status")
+                downloaded = count_with_status("download_status")
+                extracted = count_with_status("text_extraction_status")
+                analyzed = count_with_status("ai_analysis_status")
+                embedded = count_with_status("embedding_status")
 
-        # Documents téléchargés
-        cursor.execute("""
-            SELECT COUNT(*) as downloaded
-            FROM documents
-            WHERE download_status = 'success'
-        """)
-        downloaded = cursor.fetchone()['downloaded']
-
-        # Documents avec texte extrait
-        cursor.execute("""
-            SELECT COUNT(*) as extracted
-            FROM documents
-            WHERE text_extraction_status = 'success'
-        """)
-        extracted = cursor.fetchone()['extracted']
-
-        # Documents analysés avec IA
-        cursor.execute("""
-            SELECT COUNT(*) as analyzed
-            FROM documents
-            WHERE ai_analysis_status = 'success'
-        """)
-        analyzed = cursor.fetchone()['analyzed']
-
-        # Documents avec embeddings
-        cursor.execute("""
-            SELECT COUNT(*) as embedded
-            FROM documents
-            WHERE embedding_status = 'success'
-        """)
-        embedded = cursor.fetchone()['embedded']
-
-        conn.close()
-
-        return jsonify({
-            'success': True,
-            'stats': {
-                'total': total,
-                'collected': collected,
-                'downloaded': downloaded,
-                'extracted': extracted,
-                'analyzed': analyzed,
-                'embedded': embedded
-            }
-        })
-
+        return jsonify(
+            success=True,
+            stats=dict(
+                total=total,
+                collected=collected,
+                downloaded=downloaded,
+                extracted=extracted,
+                analyzed=analyzed,
+                embedded=embedded,
+            ),
+        )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# RECHERCHE SÉMANTIQUE (embeddings R2 → scoring en mémoire)
+# ============================================================================
+
+@joradp_bp.route('/search/semantic', methods=['GET'])
+def semantic_search():
+    query = (request.args.get('q') or '').strip()
+    if not query:
+        return jsonify({'error': 'Paramètre q requis'}), 400
+
+    try:
+        limit = int(request.args.get('limit', 0))
+    except ValueError:
+        limit = 0
+    score_threshold = float(request.args.get('score_threshold', 0) or 0)
+
+    cache = _load_embeddings_cache()
+    if not cache:
+        return jsonify({'error': 'Aucun embedding disponible'}), 500
+
+    model = get_embedding_model()
+    query_vec = model.encode(query, convert_to_numpy=True)
+
+    scored = []
+    for item in cache:
+        score = float(np.dot(query_vec, item["vector"])) / (
+            np.linalg.norm(query_vec) * np.linalg.norm(item["vector"])
+        )
+        scored.append(
+            {
+                "id": item["id"],
+                "url": item["url"],
+                "publication_date": item["publication_date"],
+                "file_path_r2": item["file_path_r2"],
+                "text_path_r2": item["text_path_r2"],
+                "score": round(score, 6),
+            }
+        )
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    def to_float(val):
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    for item in scored:
+        item["score"] = to_float(item.get("score"))
+
+    if limit <= 0 or limit > len(scored):
+        limit = len(scored)
+
+    score_at_limit = scored[limit - 1]["score"] if scored else None
+
+    filtered = [s for s in scored if s["score"] >= score_threshold]
+    results = filtered[:limit]
+
+    return jsonify(
+        {
+            "results": results,
+            "count": len(results),
+            "total": len(scored),
+            "max_score": to_float(scored[0]["score"]) if scored else None,
+            "min_score": to_float(scored[-1]["score"]) if scored else None,
+            "score_threshold": to_float(score_threshold),
+            "score_at_limit": to_float(score_at_limit),
+            "limit": limit,
+        }
+    )
 
 
 # ============================================================================
@@ -1558,86 +1371,71 @@ def get_global_stats():
 
 @joradp_bp.route('/batch/extract', methods=['POST'])
 def batch_extract_documents():
-    """Extraire le texte de plusieurs documents sélectionnés"""
+    """Extraire le texte (R2 → MizaneDb) pour plusieurs documents."""
     try:
-        from shared.intelligent_text_extractor import IntelligentTextExtractor
-
         data = request.json or {}
-        document_ids = data.get('document_ids', [])
-        use_vision = data.get('use_vision_api', False)
-
+        document_ids = data.get('document_ids') or []
         if not document_ids:
             return jsonify({'error': 'Aucun document spécifié'}), 400
 
-        # Activer Vision API si demandé
-        if use_vision:
-            os.environ['ENABLE_VISION_API'] = 'true'
+        numeric_ids = []
+        for doc_id in document_ids:
+            try:
+                numeric_ids.append(int(doc_id))
+            except (TypeError, ValueError):
+                continue
 
-        # Récupérer les documents
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        if not numeric_ids:
+            return jsonify({'error': 'Identifiants invalides'}), 400
 
-        placeholders = ','.join('?' * len(document_ids))
-        cursor.execute(f"""
-            SELECT id, url, file_path
-            FROM documents
-            WHERE id IN ({placeholders})
-            AND file_path IS NOT NULL
-            AND file_path LIKE '%.pdf'
-        """, document_ids)
-
-        documents = cursor.fetchall()
-
-        if documents:
-            cursor.execute(
-                f"UPDATE documents SET text_extraction_status = 'in_progress', error_log = NULL WHERE id IN ({placeholders})",
-                document_ids
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, url, file_path_r2, text_path_r2
+                FROM joradp_documents
+                WHERE id = ANY(%s)
+                  AND download_status = 'success'
+                """,
+                (numeric_ids,),
             )
-            conn.commit()
+            documents = cur.fetchall()
 
         if not documents:
-            return jsonify({
-                'success': True,
-                'message': 'Aucun document PDF à extraire',
-                'extracted': 0
-            })
+            return jsonify({'success': True, 'message': 'Aucun document éligible', 'extracted': 0})
 
-        # Extraire chaque document
-        extractor = IntelligentTextExtractor(DB_PATH)
         success_count = 0
         failed_count = 0
-        results = []
-
         for doc in documents:
-            numero = extract_num_from_url(doc['url'])
             try:
-                result = extractor.extract_and_evaluate(doc['file_path'], doc['id'])
-                success_count += 1
-                results.append({
-                    'id': doc['id'],
-                    'numero': numero,
-                    'quality': result['quality'],
-                    'method': result['method']
-                })
-            except Exception as e:
+                text_content, new_text_path = _ensure_text_content(
+                    doc['id'],
+                    doc['file_path_r2'],
+                    doc['text_path_r2'],
+                    doc['url'],
+                )
+                if text_content:
+                    success_count += 1
+                else:
+                    failed_count += 1
+            except Exception as exc:
                 failed_count += 1
-                print(f"❌ Erreur extraction doc {doc['id']}: {e}")
-                cursor.execute("""
-                    UPDATE documents
-                    SET text_extraction_status = 'failed',
-                        error_log = ?
-                    WHERE id = ?
-                """, (str(e), doc['id']))
-                conn.commit()
-
-        conn.close()
+                with get_pg_connection() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE joradp_documents
+                        SET text_extraction_status = 'failed',
+                            error_log = %s
+                        WHERE id = %s
+                        """,
+                        (str(exc), doc['id']),
+                    )
+                    conn.commit()
 
         return jsonify({
             'success': True,
             'message': f'Extraction terminée: {success_count} succès, {failed_count} échecs',
             'extracted': success_count,
             'failed': failed_count,
-            'results': results
         })
 
     except Exception as e:
@@ -1646,265 +1444,82 @@ def batch_extract_documents():
 
 @joradp_bp.route('/batch/analyze', methods=['POST'])
 def batch_analyze_documents():
-    """Analyser plusieurs documents sélectionnés avec IA + embeddings"""
+    """Analyser plusieurs documents sélectionnés avec IA + embeddings (MizaneDb)."""
     try:
         from openai import OpenAI
         from analysis import get_embedding_model
 
         data = request.json or {}
-        document_ids = data.get('document_ids', [])
-        force = data.get('force', False)
+        document_ids = data.get('document_ids') or []
+        force = bool(data.get('force', False))
         generate_embeddings = bool(data.get('generate_embeddings', False))
 
         if not document_ids:
             return jsonify({'error': 'Aucun document spécifié'}), 400
 
-        # Vérifier la clé API
+        numeric_ids = []
+        for doc_id in document_ids:
+            try:
+                numeric_ids.append(int(doc_id))
+            except (TypeError, ValueError):
+                continue
+
+        if not numeric_ids:
+            return jsonify({'error': 'Identifiants invalides'}), 400
+
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             return jsonify({'error': 'OPENAI_API_KEY non trouvée'}), 500
 
-        client = OpenAI(api_key=api_key)
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    url,
+                    publication_date,
+                    file_path_r2,
+                    text_path_r2,
+                    ai_analysis_status,
+                    embedding_status
+                FROM joradp_documents
+                WHERE id = ANY(%s)
+                  AND download_status = 'success'
+                """,
+                (numeric_ids,),
+            )
+            documents = cur.fetchall()
 
-        # Récupérer les documents
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        if not documents:
+            return jsonify({'error': 'Aucun document éligible'}), 400
 
-        placeholders = ','.join('?' * len(document_ids))
-        cursor.execute(f"""
-            SELECT
-                id,
-                file_path,
-                text_path,
-                url,
-                ai_analysis_status,
-                embedding_status
-            FROM documents
-            WHERE id IN ({placeholders})
-            AND download_status = 'success'
-        """, document_ids)
-
-        documents = cursor.fetchall()
-
-        # Filtrer les documents déjà analysés si force=False
-        to_analyze = []
-        already_analyzed = []
-        missing_text = []
-
+        # Si force=False, filtrer les documents déjà analysés
+        docs_to_process = []
+        already_analyzed = 0
         for doc in documents:
-            numero = extract_num_from_url(doc['url'])
             if not force and normalize_status(doc['ai_analysis_status']) == 'success':
-                already_analyzed.append(numero or str(doc['id']))
+                already_analyzed += 1
                 continue
+            docs_to_process.append(doc)
 
-            text_content = _fetch_r2_text(doc['text_path'])
-            if not text_content:
-                try:
-                    text_content, new_text_path = _ensure_text_content(
-                        doc['id'],
-                        doc['file_path'],
-                        doc['text_path'],
-                        doc['url']
-                    )
-                    doc['text_path'] = new_text_path
-                except Exception:
-                    missing_text.append(numero or str(doc['id']))
-                    continue
-
-            doc['_text_content'] = text_content
-            to_analyze.append(doc)
-
-        # Messages d'information
-        info_messages = []
-        if already_analyzed:
-            info_messages.append(f"{len(already_analyzed)} déjà analysé(s)")
-        if missing_text:
-            info_messages.append(f"{len(missing_text)} sans texte extrait")
-
-        if not to_analyze:
-            conn.close()
+        if not docs_to_process:
             return jsonify({
                 'success': True,
-                'message': 'Aucun document à analyser. ' + ', '.join(info_messages),
+                'message': 'Documents déjà analysés',
                 'analyzed': 0,
-                'already_analyzed': len(already_analyzed),
-                'missing_text': len(missing_text)
+                'failed': 0,
+                'already_analyzed': already_analyzed,
             })
 
-        # Analyser chaque document
-        success_count = 0
-        failed_count = 0
-        embedding_model = get_embedding_model() if generate_embeddings else None
-
-        to_analyze_ids = [doc['id'] for doc in to_analyze]
-        if to_analyze_ids:
-            placeholders_in = ','.join('?' * len(to_analyze_ids))
-            assignments = [
-                "ai_analysis_status = 'in_progress'",
-                "analyzed_at = NULL",
-                "error_log = NULL"
-            ]
-            if embedding_model:
-                assignments.append("embedding_status = 'in_progress'")
-                assignments.append("embedded_at = NULL")
-            cursor.execute(
-                f"UPDATE documents SET {', '.join(assignments)} WHERE id IN ({placeholders_in})",
-                to_analyze_ids
-            )
-            conn.commit()
-
-        for doc in to_analyze:
-            doc_id = doc['id']
-
-            try:
-                text = doc.get('_text_content')
-                if not text:
-                    text, _ = _ensure_text_content(
-                        doc_id,
-                        doc['file_path'],
-                        doc['text_path'],
-                        doc['url']
-                    )
-
-                # Générer l'embedding si le modèle est disponible
-                embedding_data = None
-                embedding_status_value = None
-                embedding_error_message = None
-
-                if embedding_model:
-                    embedding_status_value = 'failed'
-                    try:
-                        vector = embedding_model.encode(
-                            text[:5000],
-                            convert_to_numpy=True,
-                            normalize_embeddings=True
-                        )
-                        if hasattr(vector, 'tolist'):
-                            vector = vector.tolist()
-
-                        embedding_data = {
-                            'model': 'all-MiniLM-L6-v2',
-                            'dimension': len(vector),
-                            'vector': [float(v) for v in vector]
-                        }
-                        embedding_status_value = 'success'
-                    except Exception as e:
-                        embedding_error_message = f"Embedding non généré: {e}"
-                        print(f"   ⚠️  {embedding_error_message}")
-
-                # Analyser avec OpenAI
-                text_sample = text[:10000]
-
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    max_tokens=1024,
-                    messages=[{
-                        "role": "user",
-                        "content": f"""Analyse ce document officiel algérien et renvoie STRICTEMENT le JSON suivant :
-{{
-  "title": "Titre clair (génère-le si absent)",
-  "title_origin": "extracted|generated",
-  "summary": "Résumé en français (2-4 phrases)",
-  "keywords": ["mot1","mot2"],
-  "entities": ["TYPE - Nom"],
-  "draft_date": "YYYY-MM-DD ou null",
-  "language": "fr|ar|... (code ISO)"
-}}
-Rappelle-toi : 
-- \"title_origin\" doit être "extracted" si le titre est pris tel quel du document, sinon "generated".
-- \"keywords\" est un tableau (max 5 entrées).
-- \"entities\" est un tableau où TYPE ∈ {{PERSONNE, ORGANISATION, LIEU, DATE, AUTRE}}.
-- Mets null quand l'information est introuvable.
-
-Document :
-{text_sample}"""
-                    }],
-                    response_format={"type": "json_object"}
-                )
-
-                analysis_result = response.choices[0].message.content
-
-                # Sauvegarder l'embedding dans extra_metadata si disponible
-                if embedding_data:
-                    cursor.execute(
-                        "SELECT extra_metadata FROM documents WHERE id = ?",
-                        (doc_id,)
-                    )
-                    existing_extra = cursor.fetchone()
-                    merged_extra = {}
-
-                    if existing_extra and existing_extra['extra_metadata']:
-                        try:
-                            merged_extra = json.loads(existing_extra['extra_metadata'])
-                        except json.JSONDecodeError:
-                            merged_extra = {}
-
-                    merged_extra['embedding'] = embedding_data
-
-                    cursor.execute(
-                        "UPDATE documents SET extra_metadata = ? WHERE id = ?",
-                        (json.dumps(merged_extra), doc_id)
-                    )
-
-                # Sauvegarder l'analyse et les statuts
-                status_assignments = [
-                    "ai_analysis_status = 'success'",
-                    "analyzed_at = CURRENT_TIMESTAMP",
-                    "error_log = ?"
-                ]
-                status_params = [embedding_error_message]
-
-                if embedding_status_value:
-                    status_assignments.append("embedding_status = ?")
-                    status_assignments.append("embedded_at = CASE WHEN ? = 'success' THEN CURRENT_TIMESTAMP ELSE NULL END")
-                    status_params.extend([embedding_status_value, embedding_status_value])
-
-                cursor.execute(
-                    f"UPDATE documents SET {', '.join(status_assignments)} WHERE id = ?",
-                    status_params + [doc_id]
-                )
-
-                cursor.execute("""
-                    INSERT OR REPLACE INTO document_ai_analysis
-                    (document_id, extracted_text_length, summary, additional_metadata, created_at)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """, (doc_id, len(text), analysis_result[:500], analysis_result))
-
-                conn.commit()
-                success_count += 1
-                print(f"✅ Analysé: doc {doc_id}")
-
-            except Exception as e:
-                failure_message = str(e)
-                failure_assignments = [
-                    "ai_analysis_status = 'failed'",
-                    "error_log = ?",
-                    "analyzed_at = NULL"
-                ]
-                failure_params = [failure_message]
-
-                if embedding_model:
-                    failure_assignments.append("embedding_status = 'failed'")
-                    failure_assignments.append("embedded_at = NULL")
-
-                cursor.execute(
-                    f"UPDATE documents SET {', '.join(failure_assignments)} WHERE id = ?",
-                    failure_params + [doc_id]
-                )
-                conn.commit()
-                failed_count += 1
-                print(f"❌ Échec analyse doc {doc_id}: {failure_message}")
-
-        conn.close()
-
-        return jsonify({
-            'success': True,
-            'message': f'Analyse terminée: {success_count} succès, {failed_count} échecs',
-            'analyzed': success_count,
-            'failed': failed_count,
-            'already_analyzed': len(already_analyzed),
-            'missing_text': len(missing_text)
-        })
+        result = _run_ai_analysis(
+            docs_to_process,
+            client=OpenAI(api_key=api_key),
+            embedding_model=get_embedding_model() if generate_embeddings else None,
+            force=True,
+            generate_embeddings=generate_embeddings,
+            already_analyzed=already_analyzed,
+        )
+        return jsonify(result)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1912,13 +1527,13 @@ Document :
 
 @joradp_bp.route('/batch/embeddings', methods=['POST'])
 def batch_generate_embeddings():
-    """Générer uniquement les embeddings pour plusieurs documents sélectionnés"""
+    """Générer uniquement les embeddings pour plusieurs documents sélectionnés."""
     try:
         from analysis import get_embedding_model
 
         data = request.json or {}
-        document_ids = data.get('document_ids', [])
-        force = data.get('force', False)
+        document_ids = data.get('document_ids') or []
+        force = bool(data.get('force', False))
 
         if not document_ids:
             return jsonify({'error': 'Aucun document spécifié'}), 400
@@ -1927,146 +1542,300 @@ def batch_generate_embeddings():
         if not embedding_model:
             return jsonify({'error': 'Aucun modèle d\'embedding disponible'}), 500
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        placeholders = ','.join('?' * len(document_ids))
-        cursor.execute(f"""
-            SELECT id, url, file_path, text_path, embedding_status
-            FROM documents
-            WHERE id IN ({placeholders})
-        """, document_ids)
-
-        documents = cursor.fetchall()
-
-        to_embed = []
-        already_done = []
-        missing_text = []
-
-        for doc in documents:
-            numero = extract_num_from_url(doc['url']) or str(doc['id'])
-            status = normalize_status(doc['embedding_status'])
-
-            if not force and status == 'success':
-                already_done.append(numero)
+        numeric_ids = []
+        for doc_id in document_ids:
+            try:
+                numeric_ids.append(int(doc_id))
+            except (TypeError, ValueError):
                 continue
 
-            text_content = _fetch_r2_text(doc['text_path'])
+        if not numeric_ids:
+            return jsonify({'error': 'Identifiants invalides'}), 400
+
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    url,
+                    publication_date,
+                    file_path_r2,
+                    text_path_r2,
+                    embedding_status
+                FROM joradp_documents
+                WHERE id = ANY(%s)
+                  AND download_status = 'success'
+                """,
+                (numeric_ids,),
+            )
+            documents = cur.fetchall()
+
+        to_embed = []
+        already_done = 0
+        missing_text = 0
+
+        for doc in documents:
+            status = normalize_status(doc.get('embedding_status'))
+            if not force and status == 'success':
+                already_done += 1
+                continue
+
+            text_content = _fetch_r2_text(doc['text_path_r2'])
             if not text_content:
                 try:
                     text_content, new_text_path = _ensure_text_content(
                         doc['id'],
-                        doc['file_path'],
-                        doc['text_path'],
-                        doc['url']
+                        doc['file_path_r2'],
+                        doc['text_path_r2'],
+                        doc['url'],
                     )
-                    doc['text_path'] = new_text_path
+                    doc['text_path_r2'] = new_text_path
                 except Exception:
-                    missing_text.append(numero)
+                    missing_text += 1
                     continue
-
             doc['_text_content'] = text_content
             to_embed.append(doc)
 
         if not to_embed:
-            conn.close()
             return jsonify({
                 'success': True,
-                'message': 'Aucun embedding à générer.',
                 'embedded': 0,
-                'already_embedded': len(already_done),
-                'missing_text': len(missing_text)
+                'failed': 0,
+                'already_embedded': already_done,
+                'missing_text': missing_text,
             })
-
-        to_embed_ids = [doc['id'] for doc in to_embed]
-        placeholders_in = ','.join('?' * len(to_embed_ids))
-
-        cursor.execute(
-            f"UPDATE documents SET embedding_status = 'in_progress', embedded_at = NULL, error_log = NULL WHERE id IN ({placeholders_in})",
-            to_embed_ids
-        )
-        conn.commit()
 
         success_count = 0
         failed_count = 0
 
-        for doc in to_embed:
-            doc_id = doc['id']
-            numero = extract_num_from_url(doc['url']) or str(doc_id)
+        with get_pg_connection() as conn, conn.cursor() as cur:
+            for doc in to_embed:
+                doc_id = doc['id']
+                try:
+                    text = doc.get('_text_content')
+                    if not text:
+                        text, _ = _ensure_text_content(doc_id, doc['file_path_r2'], doc['text_path_r2'], doc['url'])
 
-            try:
-                text = doc.get('_text_content')
-                if not text:
-                    text, _ = _ensure_text_content(doc_id, doc['file_path'], doc['text_path'], doc['url'])
+                    vector = embedding_model.encode(
+                        text[:5000],
+                        convert_to_numpy=True,
+                        normalize_embeddings=True,
+                    )
+                    if hasattr(vector, 'tolist'):
+                        vector = vector.tolist()
 
-                vector = embedding_model.encode(
-                    text[:5000],
-                    convert_to_numpy=True,
-                    normalize_embeddings=True
-                )
-                if hasattr(vector, 'tolist'):
-                    vector = vector.tolist()
+                    embedding_data = {
+                        'model': 'all-MiniLM-L6-v2',
+                        'dimension': len(vector),
+                        'vector': [float(v) for v in vector],
+                    }
 
-                embedding_data = {
-                    'model': 'all-MiniLM-L6-v2',
-                    'dimension': len(vector),
-                    'vector': [float(v) for v in vector]
-                }
+                    _upsert_ai_metadata(
+                        cur,
+                        doc_id,
+                        {
+                            'language': 'fr',
+                            'title': None,
+                            'publication_date': doc.get('publication_date'),
+                            'summary': None,
+                            'keywords': None,
+                            'entities': None,
+                            'dates_extracted': None,
+                            'extra_metadata': {'embedding': embedding_data},
+                        },
+                    )
 
-                cursor.execute(
-                    "SELECT extra_metadata FROM documents WHERE id = ?",
-                    (doc_id,)
-                )
-                existing_extra = cursor.fetchone()
-                merged_extra = {}
-                if existing_extra and existing_extra['extra_metadata']:
-                    try:
-                        merged_extra = json.loads(existing_extra['extra_metadata'])
-                    except json.JSONDecodeError:
-                        merged_extra = {}
-
-                merged_extra['embedding'] = embedding_data
-
-                cursor.execute(
-                    """
-                    UPDATE documents
-                    SET extra_metadata = ?,
-                        embedding_status = 'success',
-                        embedded_at = CURRENT_TIMESTAMP,
-                        error_log = NULL
-                    WHERE id = ?
-                    """,
-                    (json.dumps(merged_extra), doc_id)
-                )
-                conn.commit()
-                success_count += 1
-                print(f"✅ Embedding généré pour doc {doc_id} ({numero})")
-
-            except Exception as e:
-                cursor.execute(
-                    """
-                    UPDATE documents
-                    SET embedding_status = 'failed',
-                        embedded_at = NULL,
-                        error_log = ?
-                    WHERE id = ?
-                    """,
-                    (str(e), doc_id)
-                )
-                conn.commit()
-                failed_count += 1
-                print(f"❌ Échec embedding doc {doc_id}: {e}")
-
-        conn.close()
+                    cur.execute(
+                        """
+                        UPDATE joradp_documents
+                        SET embedding_status = 'success',
+                            embedded_at = timezone('utc', now()),
+                            error_log = NULL
+                        WHERE id = %s
+                        """,
+                        (doc_id,),
+                    )
+                    success_count += 1
+                except Exception as exc:
+                    cur.execute(
+                        """
+                        UPDATE joradp_documents
+                        SET embedding_status = 'failed',
+                            embedded_at = NULL,
+                            error_log = %s
+                        WHERE id = %s
+                        """,
+                        (str(exc), doc_id),
+                    )
+                    failed_count += 1
+            conn.commit()
 
         return jsonify({
             'success': True,
             'message': f'Embeddings générés: {success_count} succès, {failed_count} échecs',
             'embedded': success_count,
             'failed': failed_count,
-            'already_embedded': len(already_done),
-            'missing_text': len(missing_text)
+            'already_embedded': already_done,
+            'missing_text': missing_text,
         })
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+def _run_ai_analysis(
+    documents,
+    *,
+    client,
+    embedding_model=None,
+    force=False,
+    generate_embeddings=True,
+    already_analyzed: int = 0,
+):
+    """Routine partagée pour analyser et stocker les métadonnées IA."""
+    success_count = 0
+    failed_count = 0
+    missing_text = 0
+
+    with get_pg_connection() as conn, conn.cursor() as cur:
+        for doc in documents:
+            doc_id = doc['id']
+            try:
+                text_content = _fetch_r2_text(doc.get('text_path_r2'))
+                new_text_path = None
+                if not text_content:
+                    text_content, new_text_path = _ensure_text_content(
+                        doc_id,
+                        doc.get('file_path_r2'),
+                        doc.get('text_path_r2'),
+                        doc.get('url'),
+                    )
+                if not text_content:
+                    missing_text += 1
+                    continue
+
+                embedding_data = None
+                embedding_status_value = None
+                if embedding_model and generate_embeddings:
+                    embedding_status_value = 'failed'
+                    try:
+                        vector = embedding_model.encode(
+                            text_content[:5000],
+                            convert_to_numpy=True,
+                            normalize_embeddings=True,
+                        )
+                        if hasattr(vector, 'tolist'):
+                            vector = vector.tolist()
+                        embedding_data = {
+                            'model': 'all-MiniLM-L6-v2',
+                            'dimension': len(vector),
+                            'vector': [float(v) for v in vector],
+                        }
+                        embedding_status_value = 'success'
+                    except Exception as exc:
+                        print(f"⚠️  Embedding non généré pour doc {doc_id}: {exc}")
+
+                text_sample = text_content[:10000]
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    max_tokens=1024,
+                    messages=[{
+                        "role": "user",
+                        "content": f"""Analyse ce document officiel algérien et renvoie un JSON avec :
+{{
+  "title": "...",
+  "summary": "...",
+  "keywords": ["mot1","mot2"],
+  "entities": ["TYPE - Valeur"],
+  "draft_date": "YYYY-MM-DD ou null",
+  "language": "fr|ar|..."
+}}
+Document :
+{text_sample}"""
+                    }],
+                    response_format={"type": "json_object"},
+                )
+
+                analysis_raw = response.choices[0].message.content
+                analysis_json = {}
+                if isinstance(analysis_raw, str):
+                    try:
+                        analysis_json = json.loads(analysis_raw)
+                    except json.JSONDecodeError:
+                        analysis_json = {}
+
+                language = (analysis_json.get('language') or 'fr').split('-')[0]
+                keywords = _normalize_keywords(analysis_json.get('keywords'))
+                entities = analysis_json.get('entities')
+                publication_date = doc.get('publication_date') or _parse_date_string(
+                    analysis_json.get('draft_date'),
+                )
+                extra_metadata = {'analysis': analysis_json}
+                if embedding_data:
+                    extra_metadata['embedding'] = embedding_data
+
+                _upsert_ai_metadata(
+                    cur,
+                    doc_id,
+                    {
+                        'language': language,
+                        'title': analysis_json.get('title'),
+                        'publication_date': publication_date,
+                        'summary': analysis_json.get('summary'),
+                        'keywords': keywords,
+                        'entities': entities,
+                        'dates_extracted': analysis_json.get('dates_extracted') or analysis_json.get('dates'),
+                        'extra_metadata': extra_metadata,
+                    },
+                )
+
+                cur.execute(
+                    """
+                    UPDATE joradp_documents
+                    SET ai_analysis_status = 'success',
+                        analyzed_at = timezone('utc', now()),
+                        embedding_status = CASE
+                            WHEN %s IS NOT NULL THEN %s
+                            ELSE embedding_status
+                        END,
+                        embedded_at = CASE
+                            WHEN %s = 'success' THEN timezone('utc', now())
+                            WHEN %s = 'failed' THEN NULL
+                            ELSE embedded_at
+                        END,
+                        text_path_r2 = COALESCE(%s, text_path_r2),
+                        error_log = NULL
+                    WHERE id = %s
+                    """,
+                    (
+                        embedding_status_value,
+                        embedding_status_value,
+                        embedding_status_value,
+                        embedding_status_value,
+                        new_text_path,
+                        doc_id,
+                    ),
+                )
+                success_count += 1
+            except Exception as exc:
+                failed_count += 1
+                cur.execute(
+                    """
+                    UPDATE joradp_documents
+                    SET ai_analysis_status = 'failed',
+                        analyzed_at = NULL,
+                        error_log = %s
+                    WHERE id = %s
+                    """,
+                    (str(exc), doc_id),
+                )
+        conn.commit()
+
+    return {
+        'success': True,
+        'message': f'Analyse terminée: {success_count} succès, {failed_count} échecs',
+        'analyzed': success_count,
+        'failed': failed_count,
+        'already_analyzed': already_analyzed,
+        'missing_text': missing_text,
+    }

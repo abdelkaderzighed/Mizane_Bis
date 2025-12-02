@@ -5,8 +5,8 @@ import CoursSupremeSearchPanel from './CoursSupremeSearchPanel';
 
 const COURSUPREME_API_URL = 'http://localhost:5001/api/coursupreme';
 
-const SEMANTIC_SCORE_THRESHOLD = 0.45;
-const SEMANTIC_ITEM_LIMIT = 20;
+const SEMANTIC_SCORE_THRESHOLD = 0;
+const SEMANTIC_ITEM_LIMIT = 9999;
 const DECISIONS_PAGE_SIZE = 20;
 
 const toIsoFromDecisionDate = (value) => {
@@ -24,6 +24,34 @@ const toIsoFromDecisionDate = (value) => {
   }
   if (year.length !== 4) return null;
   return `${year.padStart(4, '0')}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+};
+
+const formatDisplayDate = (value) => {
+  if (!value) return '—';
+  const raw = String(value).trim();
+
+  // Cas 1 : format JJ/MM/AAAA ou AAAA-MM-JJ (avec ou sans slash)
+  const isoFromSimple = toIsoFromDecisionDate(raw);
+
+  // Cas 2 : format complet type "Mon, 05 Aug 2024 00:00:00 GMT"
+  let parsedDate = null;
+  if (!isoFromSimple) {
+    const timestamp = Date.parse(raw);
+    if (!Number.isNaN(timestamp)) {
+      parsedDate = new Date(timestamp);
+    }
+  }
+
+  const datePart = isoFromSimple || (parsedDate ? parsedDate.toISOString().split('T')[0] : null);
+  if (datePart) {
+    const segments = datePart.split('-');
+    if (segments.length === 3) {
+      const [y, m, d] = segments;
+      return `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${String(y).padStart(4, '0')}`;
+    }
+  }
+
+  return raw;
 };
 
 const toIsoFromFilterDate = (value, isEnd = false) => {
@@ -183,7 +211,7 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
   };
 
   const semanticHasNumericScores = searchScoreMap.size > 0 && Array.from(searchScoreMap.values()).some(value => typeof value === 'number');
-  const showSemanticStats = semanticStats.count > 0 || semanticHasNumericScores;
+  const showSemanticStats = false;
 
   useEffect(() => {
     fetchDecisions();
@@ -375,6 +403,18 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
     setLanguageScope('both');
     setShowAdvancedSearch(false);
     setSearchTriggered(false);
+    setActiveSearchIds(null);
+    setSearchResultsSnapshot(null);
+    setSearchScoreMap(new Map());
+    setSemanticStats({
+      count: 0,
+      minScore: null,
+      maxScore: null,
+      scoreThreshold: semanticThreshold,
+      limit: semanticLimit
+    });
+    setSearchResultCount(decisions.length);
+    setFilteredDecisions(decisions);
     setResetCounter((n) => n + 1);
   };
 
@@ -566,10 +606,14 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
       fetch(`${COURSUPREME_API_URL}/search/semantic?${semanticParams.toString()}`)
         .then((res) => res.json())
         .then((data) => {
-          const allResults = (data.all_results || data.results || []).map((item) => ({
-            ...decisionsById.get(item.id),
-            ...item
-          }));
+          const allResults = (data.all_results || data.results || []).map((item) => {
+            const base = decisionsById.get(item.id) || {};
+            return {
+              ...base,
+              ...item,
+              score: item.score ?? null,
+            };
+          });
           if (!allResults.length) {
             resetSemanticState();
             applyFiltersAndSort();
@@ -597,6 +641,8 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
           });
           setSearchResultCount(limited.length);
           const matches = ids.size ? limited.filter((decision) => ids.has(decision.id)) : [];
+          setSortField('score');
+          setSortOrder('desc');
           sortDecisions(matches, scoreMap);
         })
         .catch((error) => {
@@ -1115,10 +1161,6 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
           onReset={handleResetAndSearch}
           isSearching={isSearching}
           searchResultsCount={searchResultCount}
-          semanticLimit={semanticLimit}
-          setSemanticLimit={setSemanticLimit}
-          semanticThreshold={semanticThreshold}
-          setSemanticThreshold={setSemanticThreshold}
           availableChambers={availableChambers}
           availableThemes={availableThemes}
           resetCounter={resetCounter}
@@ -1126,14 +1168,6 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
         <div className="text-sm text-gray-500 mt-2">
           Documents ramenés: {searchResultCount}
         </div>
-        {showSemanticStats && (
-          <div className="flex flex-wrap gap-4 text-xs text-gray-500 mt-2">
-            <span>Résultats sémantiques : {semanticStats.count}</span>
-            <span>Score min : {semanticStats.minScore ?? '—'}</span>
-            <span>Seuil : {semanticStats.scoreThreshold}</span>
-            <span>Limite renvoyée : {semanticStats.limit}</span>
-          </div>
-        )}
       </div>
         {/* Actions groupées */}
         {selectedDecisions.size > 0 && (
@@ -1223,6 +1257,17 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
                   )}
                 </button>
               </th>
+              <th className="p-3 text-left">
+                <button
+                  onClick={() => handleSort('score')}
+                  className="flex items-center gap-1 font-semibold text-gray-700 hover:text-gray-900"
+                >
+                  Score
+                  {sortField === 'score' && (
+                    sortOrder === 'asc' ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />
+                  )}
+                </button>
+              </th>
               <th className="p-3 text-center font-semibold text-gray-700">Téléchargé</th>
               <th className="p-3 text-center font-semibold text-gray-700">Traduit</th>
               <th className="p-3 text-center font-semibold text-gray-700">Analysé</th>
@@ -1234,16 +1279,21 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
             {paginatedDecisions.map((decision) => (
               <React.Fragment key={decision.id}>
                 <tr className="border-b hover:bg-gray-50">
-                  <td className="p-3">
-                    <input
-                      type="checkbox"
-                      checked={selectedDecisions.has(decision.id)}
-                      onChange={() => toggleSelectDecision(decision.id)}
-                      className="w-4 h-4"
-                    />
-                  </td>
-                  <td className="p-3 font-medium text-gray-800">{decision.decision_number}</td>
-                  <td className="p-3 text-gray-600">{decision.decision_date}</td>
+              <td className="p-3">
+                <input
+                  type="checkbox"
+                  checked={selectedDecisions.has(decision.id)}
+                  onChange={() => toggleSelectDecision(decision.id)}
+                  className="w-4 h-4"
+                />
+              </td>
+              <td className="p-3 font-medium text-gray-800">{decision.decision_number}</td>
+              <td className="p-3 text-gray-600">{formatDisplayDate(decision.decision_date)}</td>
+              <td className="p-3 text-gray-700">
+                {typeof decision.score === 'number'
+                  ? decision.score.toFixed(2)
+                  : (searchScoreMap.get(decision.id)?.toFixed ? searchScoreMap.get(decision.id).toFixed(2) : '-')}
+              </td>
                   <td className="p-3 text-center">
             <div className="flex justify-center">
               <StatusIndicator status={decision.status?.downloaded} />
@@ -1307,17 +1357,23 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
                       {Array.isArray(decision.chambers) && decision.chambers.length > 0 && (
                         <div className="flex gap-1 items-center">
                           <span className="font-semibold">Chambres:</span>
-                          {decision.chambers.map((c, i) => (
-                            <span key={i} className="px-2 py-1 bg-blue-100 text-blue-700 rounded">
-                              {c.name_fr}
-                            </span>
-                          ))}
+                          {[...new Map(decision.chambers
+                            .filter((c) => (c?.name_fr || '').toLowerCase() !== 'décisions classées par thèmes')
+                            .map((c) => [c.name_fr, c]))
+                            .values()].map((c, i) => (
+                              <span key={i} className="px-2 py-1 bg-blue-100 text-blue-700 rounded">
+                                {c.name_fr}
+                              </span>
+                            ))}
                         </div>
                       )}
                       {Array.isArray(decision.themes) && decision.themes.length > 0 && (
                         <div className="flex gap-1 items-center">
                           <span className="font-semibold">Thèmes:</span>
-                          {decision.themes.map((t, i) => (
+                          {[...new Map(decision.themes
+                            .filter((t) => (t?.name_fr || '').toLowerCase() !== 'décisions classées par thèmes')
+                            .map((t) => [t.name_fr, t]))
+                            .values()].map((t, i) => (
                             <span key={i} className="px-2 py-1 bg-green-100 text-green-700 rounded">
                               {t.name_fr}
                             </span>
@@ -1375,7 +1431,7 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
               <div className="flex justify-between items-start gap-4">
                 <div>
                   <h2 className="text-2xl font-bold">Décision {selectedDecision.decision_number}</h2>
-                  <p className="text-gray-600 text-sm">{selectedDecision.decision_date}</p>
+                <p className="text-gray-600 text-sm">{formatDisplayDate(selectedDecision.decision_date)}</p>
                 </div>
                 <div className="flex gap-2 bg-white rounded-lg p-1">
                   <button
@@ -1425,7 +1481,7 @@ const DecisionStatusManager = ({ exportEndpoint = 'http://localhost:5001/api/jor
                 <div>
                   <h2 className="text-2xl font-bold">🤖 Métadonnées IA</h2>
                   <p className="text-gray-600 text-sm">
-                    Décision {selectedMetadata.decision_number} • {selectedMetadata.decision_date}
+                    Décision {selectedMetadata.decision_number} • {formatDisplayDate(selectedMetadata.decision_date)}
                   </p>
                 </div>
                 <div className="flex gap-2 bg-white rounded-lg p-1">

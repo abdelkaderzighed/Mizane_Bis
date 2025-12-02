@@ -14,6 +14,8 @@ import zipfile
 import time
 from html import unescape
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from sentence_transformers import SentenceTransformer
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -22,6 +24,7 @@ if root_env.exists():
     load_dotenv(root_env)
 
 USE_SEMANTIC_SEARCH = os.getenv("COURSUPREME_ENABLE_SEMANTIC", "0") == "1"
+USE_SEMANTIC_SEARCH = True
 
 from shared.r2_storage import (
     generate_presigned_url,
@@ -31,6 +34,7 @@ from shared.r2_storage import (
     normalize_key,
     R2ConfigurationError,
 )
+from shared.postgres import get_connection as get_pg_connection
 
 NORMALIZED_DECISION_DATE = (
     "CASE WHEN length(decision_date)=10 AND substr(decision_date,3,1)='-' AND substr(decision_date,6,1)='-' "
@@ -118,7 +122,7 @@ def format_display_date(value: str | None) -> str:
     """Retourne une date au format JJ-MM-AAAA pour l'affichage."""
     if not value:
         return ''
-    value = value.strip()
+    value = str(value).strip()
     candidates = ['%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d', '%Y/%m/%d']
     for fmt in candidates:
         try:
@@ -269,6 +273,86 @@ def decode_embedding(blob):
     return np.frombuffer(blob, dtype=np.float32)
 
 
+# Embeddings cour suprême (cache R2 + modèle)
+_CS_EMBED_CACHE = None
+_CS_EMBED_MODEL = None
+
+
+def get_embedding_model():
+    global _CS_EMBED_MODEL
+    if _CS_EMBED_MODEL is None:
+        _CS_EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    return _CS_EMBED_MODEL
+
+
+def _build_embedding_url(raw_path: str | None) -> str | None:
+    if not raw_path:
+        return None
+    presigned = generate_presigned_url(raw_path)
+    if presigned:
+        return presigned
+    return build_public_url(raw_path)
+
+
+def _download_embedding(url: str) -> bytes | None:
+    try:
+        resp = requests.get(url, timeout=20)
+        if resp.ok:
+            return resp.content
+    except Exception:
+        return None
+    return None
+
+
+def _load_cs_embeddings_cache():
+    global _CS_EMBED_CACHE
+    if _CS_EMBED_CACHE is not None:
+        return _CS_EMBED_CACHE
+
+    cache = []
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, decision_number, decision_date, url,
+                       embeddings_ar_r2, embeddings_fr_r2
+                FROM supreme_court_decisions
+                WHERE embeddings_ar_r2 IS NOT NULL OR embeddings_fr_r2 IS NOT NULL
+                """
+            )
+            rows = cur.fetchall()
+
+    def worker(row):
+        emb_url = _build_embedding_url(row.get("embeddings_fr_r2") or row.get("embeddings_ar_r2"))
+        if not emb_url:
+            return None
+        blob = _download_embedding(emb_url)
+        vec = decode_embedding(blob)
+        if vec is None or vec.size == 0:
+            return None
+        norm = np.linalg.norm(vec)
+        if norm == 0:
+            return None
+        vec = vec / norm
+        return {
+            "id": row["id"],
+            "decision_number": row["decision_number"],
+            "decision_date": row["decision_date"],
+            "url": row["url"],
+            "vector": vec,
+        }
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker, row) for row in rows]
+        for fut in as_completed(futures):
+            item = fut.result()
+            if item:
+                cache.append(item)
+
+    _CS_EMBED_CACHE = cache
+    return _CS_EMBED_CACHE
+
+
 def cosine_similarity(query_vec, target_vec):
     if query_vec is None or target_vec is None:
         return None
@@ -326,22 +410,24 @@ def _delete_r2_object(raw_path: str | None) -> bool:
 @coursupreme_bp.route('/chambers', methods=['GET'])
 def get_chambers():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.create_function("normalize_text", 1, lambda value: normalize_term(value))
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT c.id, c.name_ar, c.name_fr,
-                   COUNT(DISTINCT sct.id) as theme_count,
-                   COUNT(DISTINCT scd.id) as decision_count
-            FROM supreme_court_chambers c
-            LEFT JOIN supreme_court_themes sct ON c.id = sct.chamber_id
-            LEFT JOIN supreme_court_decision_classifications scdc ON sct.id = scdc.theme_id
-            LEFT JOIN supreme_court_decisions scd ON scdc.decision_id = scd.id
-            GROUP BY c.id
-        """)
-        chambers = [dict(row) for row in cursor.fetchall()]
-        conn.close()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        c.id,
+                        c.name_ar,
+                        c.name_fr,
+                        COUNT(DISTINCT t.id) AS theme_count,
+                        COUNT(DISTINCT dc.decision_id) AS decision_count
+                    FROM supreme_court_chambers c
+                    LEFT JOIN supreme_court_themes t ON t.chamber_id = c.id
+                    LEFT JOIN supreme_court_decision_classifications dc ON dc.chamber_id = c.id
+                    GROUP BY c.id
+                    ORDER BY c.id
+                    """
+                )
+                chambers = [dict(row) for row in cur.fetchall()]
         return jsonify({'chambers': chambers})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -381,19 +467,25 @@ def collect_decisions():
 @coursupreme_bp.route('/chambers/<int:chamber_id>/themes', methods=['GET'])
 def get_themes(chamber_id):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT t.id, t.name_ar, t.name_fr,
-                   COUNT(DISTINCT scdc.decision_id) as decision_count
-            FROM supreme_court_themes t
-            LEFT JOIN supreme_court_decision_classifications scdc ON t.id = scdc.theme_id
-            WHERE t.chamber_id = ?
-            GROUP BY t.id
-        """, (chamber_id,))
-        themes = [dict(row) for row in cursor.fetchall()]
-        conn.close()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        t.id,
+                        t.name_ar,
+                        t.name_fr,
+                        t.url,
+                        COUNT(DISTINCT dc.decision_id) AS decision_count
+                    FROM supreme_court_themes t
+                    LEFT JOIN supreme_court_decision_classifications dc ON dc.theme_id = t.id
+                    WHERE t.chamber_id = %s
+                    GROUP BY t.id
+                    ORDER BY t.id
+                    """,
+                    (chamber_id,),
+                )
+                themes = [dict(row) for row in cur.fetchall()]
         return jsonify({'themes': themes})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -401,18 +493,42 @@ def get_themes(chamber_id):
 @coursupreme_bp.route('/themes/<int:theme_id>/decisions', methods=['GET'])
 def get_decisions(theme_id):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT d.id, d.decision_number, d.decision_date, d.object_ar, d.url
-            FROM supreme_court_decisions d
-            JOIN supreme_court_decision_classifications c ON d.id = c.decision_id
-            WHERE c.theme_id = ?
-            ORDER BY d.decision_date DESC
-        """, (theme_id,))
-        decisions = [dict(row) for row in cursor.fetchall()]
-        conn.close()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT
+                        d.id,
+                        d.decision_number,
+                        d.decision_date,
+                        d.object_ar,
+                        d.object_fr,
+                        d.url,
+                        d.download_status,
+                        d.file_path_ar_r2,
+                        d.file_path_fr_r2,
+                        d.html_content_ar_r2,
+                        d.html_content_fr_r2
+                    FROM supreme_court_decisions d
+                    JOIN supreme_court_decision_classifications c ON d.id = c.decision_id
+                    WHERE c.theme_id = %s
+                    ORDER BY d.decision_date DESC NULLS LAST, d.id DESC
+                    """,
+                    (theme_id,),
+                )
+                rows = cur.fetchall()
+
+        decisions = []
+        for row in rows:
+            row = dict(row)
+            html_ar = row.pop('html_content_ar_r2', None)
+            html_fr = row.pop('html_content_fr_r2', None)
+            row['content_ar'] = _fetch_text_from_r2(row.get('file_path_ar_r2'), html_ar)
+            row['content_fr'] = _fetch_text_from_r2(row.get('file_path_fr_r2'), html_fr)
+            row.pop('file_path_ar_r2', None)
+            row.pop('file_path_fr_r2', None)
+            decisions.append(row)
+
         return jsonify({'decisions': decisions})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -420,39 +536,40 @@ def get_decisions(theme_id):
 @coursupreme_bp.route('/decisions/<int:decision_id>', methods=['GET'])
 def get_decision(decision_id):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, decision_number, decision_date, 
-                   object_ar, object_fr, url,
-                   file_path_ar, file_path_fr,
-                   html_content_ar, html_content_fr,
-                   arguments_ar, arguments_fr,
-                   legal_reference_ar, legal_reference_fr,
-                   parties_ar, parties_fr,
-                   court_response_ar, court_response_fr,
-                   president, rapporteur,
-                   title_ar, title_fr, summary_ar, summary_fr,
-                   entities_ar, entities_fr
-            FROM supreme_court_decisions WHERE id = ?
-        ''', (decision_id,))
-        row = cursor.fetchone()
-        conn.close()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        d.id, d.decision_number, d.decision_date,
+                        d.object_ar, d.object_fr, d.url,
+                        d.file_path_ar_r2, d.file_path_fr_r2,
+                        d.html_content_ar_r2, d.html_content_fr_r2,
+                        d.arguments_r2, d.analysis_ar_r2, d.analysis_fr_r2,
+                        d.legal_reference_ar, d.legal_reference_fr,
+                        d.parties_ar, d.parties_fr,
+                        d.court_response_ar, d.court_response_fr,
+                        d.president, d.rapporteur,
+                        d.title_ar, d.title_fr, d.summary_ar, d.summary_fr,
+                        d.entities_ar, d.entities_fr
+                    FROM supreme_court_decisions d
+                    WHERE d.id = %s
+                    """,
+                    (decision_id,),
+                )
+                row = cur.fetchone()
+
         if row:
             decision = dict(row)
-            
-            html_ar = decision.pop('html_content_ar', None)
-            html_fr = decision.pop('html_content_fr', None)
-            decision['content_ar'] = _fetch_text_from_r2(decision.get('file_path_ar'), html_ar)
-            decision['content_fr'] = _fetch_text_from_r2(decision.get('file_path_fr'), html_fr)
-            
-            # Nettoyer les champs inutiles
-            decision.pop('html_content_ar', None)
-            decision.pop('html_content_fr', None)
-            decision.pop('file_path_ar', None)
-            decision.pop('file_path_fr', None)
-            
+
+            html_ar = decision.pop('html_content_ar_r2', None)
+            html_fr = decision.pop('html_content_fr_r2', None)
+            decision['content_ar'] = _fetch_text_from_r2(decision.get('file_path_ar_r2'), html_ar)
+            decision['content_fr'] = _fetch_text_from_r2(decision.get('file_path_fr_r2'), html_fr)
+
+            decision.pop('file_path_ar_r2', None)
+            decision.pop('file_path_fr_r2', None)
+
             return jsonify(decision)
         return jsonify({'error': 'Not found'}), 404
     except Exception as e:
@@ -561,102 +678,91 @@ def delete_decision(decision_id):
 def get_decisions_status():
     """Récupérer toutes les décisions avec leur statut de complétion détaillé"""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        d.id,
+                        d.decision_number,
+                        d.decision_date,
+                        d.url,
+                        d.file_path_ar_r2,
+                        d.file_path_fr_r2,
+                        d.html_content_ar_r2,
+                        d.html_content_fr_r2,
+                        d.analysis_ar_r2,
+                        d.analysis_fr_r2,
+                        d.embeddings_ar_r2,
+                        d.embeddings_fr_r2,
+                        d.title_ar,
+                        d.title_fr,
+                        d.object_ar,
+                        d.object_fr
+                    FROM supreme_court_decisions d
+                    ORDER BY d.decision_date DESC NULLS LAST, d.decision_number DESC
+                    """
+                )
+                decisions_raw = cur.fetchall()
 
-        # Récupérer toutes les décisions avec leurs statuts
-        cursor.execute("""
-            SELECT
-                d.id,
-                d.decision_number,
-                d.decision_date,
-                d.url,
-                d.file_path_ar,
-                d.file_path_fr,
-                d.html_content_ar,
-                d.html_content_fr,
-                d.title_ar,
-                d.title_fr,
-            d.summary_ar,
-            d.summary_fr,
-            d.object_ar,
-            d.object_fr,
-                d.keywords_ar,
-                d.keywords_fr,
-                d.entities_ar,
-                d.entities_fr,
-                d.embedding_ar,
-                d.embedding_fr
-            FROM supreme_court_decisions d
-            ORDER BY d.decision_date DESC, d.decision_number DESC
-        """)
+                # Précharger chambres et thèmes pour limiter les requêtes
+                cur.execute(
+                    """
+                    SELECT DISTINCT dc.decision_id, c.name_fr, c.name_ar
+                    FROM supreme_court_decision_classifications dc
+                    JOIN supreme_court_chambers c ON c.id = dc.chamber_id
+                    """
+                )
+                chamber_map = {}
+                for row in cur.fetchall():
+                    dec_id = row['decision_id']
+                    chamber_map.setdefault(dec_id, [])
+                    entry = {'name_fr': row['name_fr'], 'name_ar': row['name_ar']}
+                    if entry not in chamber_map[dec_id]:
+                        chamber_map[dec_id].append(entry)
 
-        decisions_raw = cursor.fetchall()
+                cur.execute(
+                    """
+                    SELECT DISTINCT dc.decision_id, t.name_fr, t.name_ar
+                    FROM supreme_court_decision_classifications dc
+                    JOIN supreme_court_themes t ON t.id = dc.theme_id
+                    """
+                )
+                theme_map = {}
+                for row in cur.fetchall():
+                    dec_id = row['decision_id']
+                    theme_map.setdefault(dec_id, [])
+                    entry = {'name_fr': row['name_fr'], 'name_ar': row['name_ar']}
+                    name_fr = (entry.get('name_fr') or '').strip().lower()
+                    if name_fr == 'décisions classées par thèmes':
+                        continue
+                    if entry not in theme_map[dec_id]:
+                        theme_map[dec_id].append(entry)
+
         decisions = []
 
         for row in decisions_raw:
             dec = dict(row)
 
-            has_file_ar = bool(dec['file_path_ar'])
-            has_html_ar = bool(dec['html_content_ar'])
-            has_file_fr = bool(dec['file_path_fr'])
-            has_html_fr = bool(dec['html_content_fr'])
+            downloaded_status = 'missing'
+            if any([
+                dec.get('file_path_ar_r2'),
+                dec.get('file_path_fr_r2'),
+                dec.get('html_content_ar_r2'),
+                dec.get('html_content_fr_r2'),
+            ]):
+                downloaded_status = 'complete'
 
-            downloaded_status = 'complete' if (has_file_ar or has_html_ar) else 'missing'
-            translated_status = 'complete' if (has_file_fr or has_html_fr) else 'missing'
+            translated_status = 'complete' if dec.get('file_path_fr_r2') or dec.get('html_content_fr_r2') else 'missing'
 
-            # Calcul du statut "analyzed"
-            has_title_ar = bool(dec['title_ar'])
-            has_title_fr = bool(dec['title_fr'])
-            has_summary_ar = bool(dec['summary_ar'])
-            has_summary_fr = bool(dec['summary_fr'])
-            has_keywords_ar = bool(dec['keywords_ar'])
-            has_keywords_fr = bool(dec['keywords_fr'])
-            has_entities_ar = bool(dec['entities_ar'])
-            has_entities_fr = bool(dec['entities_fr'])
+            has_analysis = bool(dec.get('analysis_ar_r2') or dec.get('analysis_fr_r2'))
+            has_titles = bool(dec.get('title_ar') or dec.get('title_fr') or dec.get('object_ar') or dec.get('object_fr'))
+            analyzed_status = 'complete' if has_analysis else ('partial' if has_titles else 'missing')
 
-            analyzed_ar = has_title_ar and has_summary_ar and has_keywords_ar and has_entities_ar
-            analyzed_fr = has_title_fr and has_summary_fr and has_keywords_fr and has_entities_fr
+            emb_ar = bool(dec.get('embeddings_ar_r2'))
+            emb_fr = bool(dec.get('embeddings_fr_r2'))
+            embeddings_status = 'complete' if (emb_ar and emb_fr) else ('partial' if (emb_ar or emb_fr) else 'missing')
 
-            if analyzed_ar and analyzed_fr:
-                analyzed_status = 'complete'
-            elif analyzed_ar or analyzed_fr or has_title_ar or has_title_fr:
-                analyzed_status = 'partial'
-            else:
-                analyzed_status = 'missing'
-
-            # Calcul du statut "embeddings"
-            has_embedding_ar = bool(dec['embedding_ar'])
-            has_embedding_fr = bool(dec['embedding_fr'])
-
-            if has_embedding_ar and has_embedding_fr:
-                embeddings_status = 'complete'
-            elif has_embedding_ar or has_embedding_fr:
-                embeddings_status = 'partial'
-            else:
-                embeddings_status = 'missing'
-
-            # Récupérer les chambres et thèmes
-            cursor.execute("""
-                SELECT DISTINCT c.name_fr, c.name_ar
-                FROM supreme_court_chambers c
-                JOIN supreme_court_decision_classifications dc ON c.id = dc.chamber_id
-                WHERE dc.decision_id = ?
-            """, (dec['id'],))
-            chambers_raw = cursor.fetchall()
-            chambers = [{'name_fr': c['name_fr'], 'name_ar': c['name_ar']} for c in chambers_raw]
-
-            cursor.execute("""
-                SELECT DISTINCT t.name_fr, t.name_ar
-                FROM supreme_court_themes t
-                JOIN supreme_court_decision_classifications dc ON t.id = dc.theme_id
-                WHERE dc.decision_id = ?
-            """, (dec['id'],))
-            themes_raw = cursor.fetchall()
-            themes = [{'name_fr': t['name_fr'], 'name_ar': t['name_ar']} for t in themes_raw]
-
-            # Construire l'objet décision
             decisions.append({
                 'id': dec['id'],
                 'decision_number': dec['decision_number'],
@@ -668,15 +774,13 @@ def get_decisions_status():
                     'analyzed': analyzed_status,
                     'embeddings': embeddings_status
                 },
-                'chambers': chambers,
-                'themes': themes,
-                'summary_ar': dec['summary_ar'],
-                'summary_fr': dec['summary_fr'],
-                'object_ar': dec['object_ar'],
-                'object_fr': dec['object_fr']
+                'chambers': chamber_map.get(dec['id'], []),
+                'themes': theme_map.get(dec['id'], []),
+                'summary_ar': dec.get('analysis_ar_r2'),
+                'summary_fr': dec.get('analysis_fr_r2'),
+                'object_ar': dec.get('object_ar'),
+                'object_fr': dec.get('object_fr')
             })
-
-        conn.close()
 
         return jsonify({
             'decisions': decisions,
@@ -684,6 +788,8 @@ def get_decisions_status():
         })
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
@@ -1464,20 +1570,20 @@ def get_chamber_all_ids(chamber_id):
 def get_all_themes():
     """Liste complète des thèmes avec leur chambre (pour autocomplétion)."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT t.id,
-                   t.name_ar,
-                   t.name_fr,
-                   t.chamber_id
-            FROM supreme_court_themes t
-            WHERE t.name_ar IS NOT NULL OR t.name_fr IS NOT NULL
-            ORDER BY t.chamber_id, t.id
-        """)
-        themes = [dict(row) for row in cursor.fetchall()]
-        conn.close()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT t.id,
+                           t.name_ar,
+                           t.name_fr,
+                           t.chamber_id
+                    FROM supreme_court_themes t
+                    WHERE t.name_ar IS NOT NULL OR t.name_fr IS NOT NULL
+                    ORDER BY t.chamber_id, t.id
+                    """
+                )
+                themes = [dict(row) for row in cur.fetchall()]
         return jsonify({'themes': themes, 'count': len(themes)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1497,348 +1603,232 @@ def rebuild_french_index():
 
 @coursupreme_bp.route('/search/advanced', methods=['GET'])
 def advanced_search():
-    """Recherche avancée avec keywords inclusifs/exclusifs et dates"""
-
+    """Recherche avancée (PostgreSQL) : mots-clés, dates, décision, chambres/thèmes."""
     keywords_inc = request.args.get('keywords_inc', '')
     keywords_or = request.args.get('keywords_or', '')
     keywords_exc = request.args.get('keywords_exc', '')
     decision_number = request.args.get('decision_number', '')
     date_from = request.args.get('date_from', '')
     date_to = request.args.get('date_to', '')
-    language_scope = request.args.get('language_scope', 'both')
-    chambers_inc = _parse_id_list(request.args.get('chambers_inc', ''))
-    chambers_or = _parse_id_list(request.args.get('chambers_or', ''))
-    themes_inc = _parse_id_list(request.args.get('themes_inc', ''))
-    themes_or = _parse_id_list(request.args.get('themes_or', ''))
+    from datetime import date as _date
+    if isinstance(date_from, (datetime, _date)):
+        date_from = date_from.strftime('%Y-%m-%d')
+    if isinstance(date_to, (datetime, _date)):
+        date_to = date_to.strftime('%Y-%m-%d')
+    chambers_inc = [int(x) for x in _parse_id_list(request.args.get('chambers_inc', '')) if str(x).isdigit()]
+    chambers_or = [int(x) for x in _parse_id_list(request.args.get('chambers_or', '')) if str(x).isdigit()]
+    themes_inc = [int(x) for x in _parse_id_list(request.args.get('themes_inc', '')) if str(x).isdigit()]
+    themes_or = [int(x) for x in _parse_id_list(request.args.get('themes_or', '')) if str(x).isdigit()]
 
-    keywords_inc_tokens = tokenize_query_param(keywords_inc)
-    keywords_or_tokens = tokenize_query_param(keywords_or)
-    keywords_exc_tokens = tokenize_query_param(keywords_exc)
+    tokens_inc = tokenize_query_param(keywords_inc)
+    tokens_or = tokenize_query_param(keywords_or)
+    tokens_exc = tokenize_query_param(keywords_exc)
+
+    where = []
+    params = []
+
+    if decision_number:
+        where.append("decision_number ILIKE %s")
+        params.append(f"%{decision_number}%")
+
+    if date_from:
+        where.append("decision_date >= %s")
+        params.append(parse_fuzzy_date(date_from))
+    if date_to:
+        where.append("decision_date <= %s")
+        params.append(parse_fuzzy_date(date_to, is_end=True))
+
+    def add_token_clause(token):
+        where.append(
+            "(object_ar ILIKE %s OR object_fr ILIKE %s OR title_ar ILIKE %s OR title_fr ILIKE %s)"
+        )
+        params.extend([f"%{token}%"] * 4)
+
+    for tok in tokens_inc:
+        add_token_clause(tok)
+
+    if tokens_or:
+        ors = []
+        for tok in tokens_or:
+            ors.append(
+                "(object_ar ILIKE %s OR object_fr ILIKE %s OR title_ar ILIKE %s OR title_fr ILIKE %s)"
+            )
+            params.extend([f"%{tok}%"] * 4)
+        where.append("(" + " OR ".join(ors) + ")")
+
+    if tokens_exc:
+        for tok in tokens_exc:
+            where.append(
+                "NOT (object_ar ILIKE %s OR object_fr ILIKE %s OR title_ar ILIKE %s OR title_fr ILIKE %s)"
+            )
+            params.extend([f"%{tok}%"] * 4)
+
+    if chambers_inc:
+        placeholders = ",".join(["%s"] * len(chambers_inc))
+        where.append(
+            f"id IN (SELECT decision_id FROM supreme_court_decision_classifications WHERE chamber_id IN ({placeholders}))"
+        )
+        params.extend(chambers_inc)
+    if themes_inc:
+        placeholders = ",".join(["%s"] * len(themes_inc))
+        where.append(
+            f"id IN (SELECT decision_id FROM supreme_court_decision_classifications WHERE theme_id IN ({placeholders}))"
+        )
+        params.extend(themes_inc)
+    if chambers_or:
+        placeholders = ",".join(["%s"] * len(chambers_or))
+        where.append(
+            f"id IN (SELECT decision_id FROM supreme_court_decision_classifications WHERE chamber_id IN ({placeholders}))"
+        )
+        params.extend(chambers_or)
+    if themes_or:
+        placeholders = ",".join(["%s"] * len(themes_or))
+        where.append(
+            f"id IN (SELECT decision_id FROM supreme_court_decision_classifications WHERE theme_id IN ({placeholders}))"
+        )
+        params.extend(themes_or)
+
+    where_sql = " AND ".join(where) if where else "1=1"
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        ensure_french_index(conn)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        where_clauses = []
-        params = []
-        order_parts = []
-        order_params = []
-
-        if decision_number:
-            where_clauses.append("decision_number LIKE ?")
-            params.append(f'%{decision_number}%')
-            order_parts.append("CASE WHEN decision_number LIKE ? THEN 0 ELSE 1 END")
-            order_params.append(f"{decision_number}%")
-
-        if date_from:
-            where_clauses.append(f"{NORMALIZED_DECISION_DATE} >= ?")
-            params.append(parse_fuzzy_date(date_from))
-        if date_to:
-            where_clauses.append(f"{NORMALIZED_DECISION_DATE} <= ?")
-            params.append(parse_fuzzy_date(date_to, is_end=True))
-
-        order_parts.append("decision_date DESC")
-        order_parts.append("decision_number ASC")
-
-        candidate_ids = None
-        def intersect_ids(new_ids: set):
-            nonlocal candidate_ids
-            if new_ids is None:
-                return
-            if candidate_ids is None:
-                candidate_ids = set(new_ids)
-            else:
-                candidate_ids &= set(new_ids)
-            return candidate_ids
-
-        if keywords_inc_tokens:
-            for token in keywords_inc_tokens:
-                ids = get_decision_ids_for_token(cursor, token)
-                intersect_ids(ids)
-                if candidate_ids is not None and not candidate_ids:
-                    cursor.close()
-                    conn.close()
-                    return jsonify({'results': [], 'count': 0})
-
-        if keywords_or_tokens:
-            or_ids = set()
-            for token in keywords_or_tokens:
-                or_ids |= get_decision_ids_for_token(cursor, token)
-            intersect_ids(or_ids if or_ids else set())
-            if candidate_ids is not None and not candidate_ids:
-                cursor.close()
-                conn.close()
-                return jsonify({'results': [], 'count': 0})
-
-        if chambers_inc:
-            ids = get_decision_ids_for_classification(cursor, "chamber_id", chambers_inc, require_all=True)
-            intersect_ids(ids)
-            if candidate_ids is not None and not candidate_ids:
-                cursor.close()
-                conn.close()
-                return jsonify({'results': [], 'count': 0})
-
-        if themes_inc:
-            ids = get_decision_ids_for_classification(cursor, "theme_id", themes_inc, require_all=True)
-            intersect_ids(ids)
-            if candidate_ids is not None and not candidate_ids:
-                cursor.close()
-                conn.close()
-                return jsonify({'results': [], 'count': 0})
-
-        if candidate_ids is not None:
-            where_clauses.append(f"id IN ({','.join('?' for _ in candidate_ids)})")
-            params.extend(sorted(candidate_ids))
-
-        if chambers_or:
-            where_clauses.append(f"id IN (SELECT decision_id FROM supreme_court_decision_classifications WHERE chamber_id IN ({','.join('?' for _ in chambers_or)}))")
-            params.extend(chambers_or)
-
-        if themes_or:
-            where_clauses.append(f"id IN (SELECT decision_id FROM supreme_court_decision_classifications WHERE theme_id IN ({','.join('?' for _ in themes_or)}))")
-            params.extend(themes_or)
-
-        if keywords_exc_tokens:
-            exc_ids = set()
-            for token in keywords_exc_tokens:
-                exc_ids |= get_decision_ids_for_token(cursor, token)
-            if exc_ids:
-                where_clauses.append(f"id NOT IN ({','.join('?' for _ in exc_ids)})")
-                params.extend(sorted(exc_ids))
-
-        where_sql = ' AND '.join(where_clauses) if where_clauses else '1=1'
-        order_parts_processed = [
-            part.replace('decision_date', NORMALIZED_DECISION_DATE)
-            if 'decision_date' in part else part
-            for part in order_parts
-        ]
-        order_sql = f"ORDER BY {', '.join(order_parts_processed)}" if order_parts_processed else f"ORDER BY {NORMALIZED_DECISION_DATE} DESC"
-
-        query = f"""
-            SELECT id,
-                   decision_number,
-                   decision_date,
-                   object_ar,
-                   object_fr,
-                   url
-            FROM supreme_court_decisions
-            WHERE {where_sql}
-            {order_sql}
-            LIMIT 100
-        """
-
-        cursor.execute(query, params + order_params)
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id,
+                           decision_number,
+                           decision_date,
+                           object_ar,
+                           object_fr,
+                           url
+                    FROM supreme_court_decisions
+                    WHERE {where_sql}
+                    ORDER BY decision_date DESC NULLS LAST, id DESC
+                    LIMIT 100
+                    """,
+                    params,
+                )
+                rows = cur.fetchall()
         candidates = []
-        for row in cursor.fetchall():
+        for row in rows:
             entry = dict(row)
             entry['decision_date'] = format_display_date(entry.get('decision_date'))
             candidates.append(entry)
-        conn.close()
-
         return jsonify({'results': candidates, 'count': len(candidates)})
     except Exception as e:
+        print("⚠️ advanced_search error:", e)
         return jsonify({'error': str(e)}), 500
 
 
 @coursupreme_bp.route('/search/semantic', methods=['GET'])
 def semantic_search():
-    """Recherche sémantique par embedding (FR/AR/both)."""
-    query = request.args.get('q', '').strip()
+    """Recherche sémantique par embedding (PostgreSQL + R2, scores triés)."""
+    query = (request.args.get('q') or '').strip()
     if not query:
         return jsonify({'error': 'Paramètre q requis'}), 400
-    terms = [part for part in re.split(r'\s+', query) if part]
 
     try:
-        limit = int(request.args.get('limit', 10))
+        limit = int(request.args.get('limit', 0))
     except ValueError:
-        limit = 10
-    limit = max(1, min(limit, 50))
+        limit = 0
 
     try:
-        score_threshold = float(request.args.get('score_threshold', 0.35))
+        score_threshold = float(request.args.get('score_threshold', 0.0) or 0.0)
     except ValueError:
-        score_threshold = 0.35
-    score_threshold = max(0.0, min(score_threshold, 1.0))
-
-    language_scope = request.args.get('language_scope', 'both')
-
-    def run_text_fallback(limit_count):
-        like_param = f"%{query}%"
-        with sqlite3.connect(DB_PATH) as fallback_conn:
-            fallback_conn.row_factory = sqlite3.Row
-            fallback_cursor = fallback_conn.cursor()
-            fallback_cursor.execute("""
-                SELECT
-                    id, decision_number, decision_date,
-                    object_ar, object_fr,
-                    summary_ar, summary_fr
-                FROM supreme_court_decisions
-                WHERE object_ar LIKE ?
-                   OR object_fr LIKE ?
-                   OR summary_ar LIKE ?
-                   OR summary_fr LIKE ?
-                   OR title_ar LIKE ?
-                   OR title_fr LIKE ?
-                LIMIT ?
-            """, (like_param, like_param, like_param, like_param, like_param, like_param, limit_count))
-        fallback_rows = [dict(row) for row in fallback_cursor.fetchall()]
-        return fallback_rows, len(fallback_rows)
-
-    # Si la requête ne contient qu'un seul mot, on privilégie une recherche texte simple.
-    if len(terms) == 1:
-        fallback_results, fallback_count = run_text_fallback(limit)
-        return jsonify({
-            'results': fallback_results[:limit],
-            'all_results': fallback_results,
-            'count': fallback_count,
-            'max_score': None,
-            'min_score': None,
-            'score_threshold': score_threshold,
-            'limit': limit,
-            'mode': 'keyword'
-        })
-
-    if not USE_SEMANTIC_SEARCH:
-        fallback_results, fallback_count = run_text_fallback(limit)
-        return jsonify({
-            'results': fallback_results,
-            'all_results': fallback_results,
-            'count': fallback_count,
-            'max_score': None,
-            'min_score': None,
-            'score_threshold': score_threshold,
-            'limit': limit,
-            'error': 'semantic search disabled, fallback applied'
-        })
+        score_threshold = 0.0
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT id, decision_number, decision_date,
-                   object_ar, object_fr,
-                   summary_ar, summary_fr,
-                   embedding_ar, embedding_fr
-            FROM supreme_court_decisions
-            WHERE (embedding_fr IS NOT NULL AND embedding_fr != '')
-               OR (embedding_ar IS NOT NULL AND embedding_ar != '')
-        """)
-        rows = cursor.fetchall()
-        conn.close()
+        cache = _load_cs_embeddings_cache()
+        if not cache:
+            return jsonify({'error': 'Aucun embedding disponible'}), 500
 
         model = get_embedding_model()
-        if model is None:
-            raise RuntimeError("embedding model unavailable")
         query_vec = model.encode(query, convert_to_numpy=True)
+        qnorm = np.linalg.norm(query_vec)
+        if qnorm == 0:
+            return jsonify({'error': 'Embedding requête invalide'}), 400
+        query_vec = query_vec / qnorm
 
-        scored = []  # Scores calculés sur embeddings FR uniquement
-        for row in rows:
-            emb_fr = decode_embedding(row['embedding_fr'])
-            score = cosine_similarity(query_vec, emb_fr)
-            if score is not None:
-                scored.append({
-                    'id': row['id'],
-                    'decision_number': row['decision_number'],
-                    'decision_date': row['decision_date'],
-                    'object_ar': row['object_ar'],
-                    'object_fr': row['object_fr'],
-                    'summary_ar': row['summary_ar'],
-                    'summary_fr': row['summary_fr'],
-                    'score': round(score, 4)
-                })
-
-        scored.sort(key=lambda entry: entry['score'], reverse=True)
-        filtered = [entry for entry in scored if entry['score'] >= score_threshold]
-        returned = filtered[:limit] if filtered else []
-
-        if scored:
-            return jsonify({
-                'results': returned,
-                'all_results': scored,
-                'count': len(scored),
-                'max_score': scored[0]['score'],
-                'min_score': scored[-1]['score'],
-                'score_threshold': score_threshold,
-                'limit': limit,
-                'mode': 'semantic'
+        scored = []
+        for item in cache:
+            score = float(np.dot(query_vec, item["vector"]))
+            scored.append({
+                "id": item["id"],
+                "decision_number": item["decision_number"],
+                "decision_date": item["decision_date"],
+                "url": item["url"],
+                "score": round(score, 6),
             })
 
-        fallback_results, fallback_count = run_text_fallback(limit)
+        scored.sort(key=lambda x: x["score"], reverse=True)
+
+        if limit <= 0 or limit > len(scored):
+            limit = len(scored)
+
+        score_at_limit = scored[limit - 1]["score"] if scored else None
+        filtered = [s for s in scored if s["score"] >= score_threshold]
+        results = filtered[:limit]
+
+        def to_float(val):
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        for item in results:
+            item["score"] = to_float(item.get("score"))
+
         return jsonify({
-            'results': fallback_results,
-            'all_results': fallback_results,
-            'count': fallback_count,
-            'max_score': None,
-            'min_score': None,
-            'score_threshold': score_threshold,
-            'limit': limit,
-            'error': 'semantic search returned no matches, fallback applied'
+            "results": results,
+            "count": len(results),
+            "total": len(scored),
+            "max_score": to_float(scored[0]["score"]) if scored else None,
+            "min_score": to_float(scored[-1]["score"]) if scored else None,
+            "score_threshold": to_float(score_threshold),
+            "score_at_limit": to_float(score_at_limit),
+            "limit": limit,
         })
     except Exception as exc:
-        fallback_results, fallback_count = run_text_fallback(limit)
-        return jsonify({
-            'results': fallback_results,
-            'all_results': fallback_results,
-            'count': fallback_count,
-            'max_score': None,
-            'min_score': None,
-            'score_threshold': score_threshold,
-            'limit': limit,
-            'error': str(exc)
-        })
+        return jsonify({'error': str(exc)}), 500
 
 
 @coursupreme_bp.route('/stats', methods=['GET'])
 def get_global_stats():
-    """Récupérer les statistiques globales pour Cour Suprême"""
+    """Récupérer les statistiques globales pour Cour Suprême (MizaneDb)."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        # Total de décisions
-        cursor.execute("SELECT COUNT(*) as total FROM supreme_court_decisions")
-        total = cursor.fetchone()['total']
-
-        # Décisions téléchargées (HTML arabe)
-        cursor.execute("""
-            SELECT COUNT(*) as downloaded
-            FROM supreme_court_decisions
-            WHERE download_status IN ('downloaded', 'completed')
-        """)
-        downloaded = cursor.fetchone()['downloaded']
-
-        # Décisions traduites (HTML français)
-        cursor.execute("""
-            SELECT COUNT(*) as translated
-            FROM supreme_court_decisions
-            WHERE (html_content_fr IS NOT NULL AND html_content_fr != '')
-               OR (file_path_fr IS NOT NULL AND file_path_fr != '')
-        """)
-        translated = cursor.fetchone()['translated']
-
-        # Décisions analysées avec IA
-        cursor.execute("""
-            SELECT COUNT(*) as analyzed
-            FROM supreme_court_decisions
-            WHERE summary_fr IS NOT NULL
-            AND summary_fr != ''
-        """)
-        analyzed = cursor.fetchone()['analyzed']
-
-        # Décisions avec embeddings
-        cursor.execute("""
-            SELECT COUNT(*) as embedded
-            FROM supreme_court_decisions
-            WHERE embedding_fr IS NOT NULL
-               OR embedding_ar IS NOT NULL
-        """)
-        embedded = cursor.fetchone()['embedded']
-
-        conn.close()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total,
+                        COUNT(*) FILTER (
+                            WHERE download_status IN ('downloaded','completed','success')
+                               OR file_path_ar_r2 IS NOT NULL
+                               OR file_path_fr_r2 IS NOT NULL
+                        ) AS downloaded,
+                        COUNT(*) FILTER (
+                            WHERE html_content_fr_r2 IS NOT NULL
+                               OR analysis_fr_r2 IS NOT NULL
+                               OR file_path_fr_r2 IS NOT NULL
+                        ) AS translated,
+                        COUNT(*) FILTER (
+                            WHERE analysis_fr_r2 IS NOT NULL
+                               OR analysis_ar_r2 IS NOT NULL
+                        ) AS analyzed,
+                        COUNT(*) FILTER (
+                            WHERE embeddings_fr_r2 IS NOT NULL
+                               OR embeddings_ar_r2 IS NOT NULL
+                        ) AS embedded
+                    FROM supreme_court_decisions
+                    """
+                )
+                row = cur.fetchone()
+                total = row['total']
+                downloaded = row['downloaded']
+                translated = row['translated']
+                analyzed = row['analyzed']
+                embedded = row['embedded']
 
         return jsonify({
             'success': True,

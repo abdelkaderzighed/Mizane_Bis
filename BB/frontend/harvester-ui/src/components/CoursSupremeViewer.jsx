@@ -43,6 +43,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
     onConfirm: () => {}
   });
   const closeBatchModal = () => setBatchModal(prev => ({ ...prev, isOpen: false }));
+  const safeChambers = Array.isArray(chambers) ? chambers : [];
 
   useEffect(() => {
     fetchChambers();
@@ -291,7 +292,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
 
   // Vérifier si TOUTES les décisions sont sélectionnées
   const areAllDecisionsSelected = () => {
-    const allDecisionIds = chambers.flatMap(chamber => {
+    const allDecisionIds = safeChambers.flatMap(chamber => {
       const chamberThemes = themes[chamber.id] || [];
       return chamberThemes.flatMap(theme => (decisions[theme.id] || []).map(d => d.id));
     });
@@ -311,7 +312,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
         const allDecisionIds = [];
 
         // Pour chaque chambre
-        for (const chamber of chambers) {
+        for (const chamber of safeChambers) {
           // Charger les thèmes si pas déjà chargés
           let chamberThemes = themes[chamber.id];
           if (!chamberThemes) {
@@ -350,10 +351,11 @@ const CoursSupremeViewer = ({ embedded = false }) => {
     try {
       const response = await fetch('http://localhost:5001/api/coursupreme/chambers');
       const data = await response.json();
-      setChambers(data.chambers);
+      setChambers(Array.isArray(data?.chambers) ? data.chambers : []);
       setLoading(false);
     } catch (error) {
       console.error('Erreur:', error);
+      setChambers([]);
       setLoading(false);
     }
   };
@@ -373,9 +375,11 @@ const CoursSupremeViewer = ({ embedded = false }) => {
     try {
       const response = await fetch(`http://localhost:5001/api/coursupreme/chambers/${chamberId}/themes`);
       const data = await response.json();
-      setThemes(prev => ({ ...prev, [chamberId]: data.themes }));
+      const chamberThemes = Array.isArray(data?.themes) ? data.themes : [];
+      setThemes(prev => ({ ...prev, [chamberId]: chamberThemes }));
     } catch (error) {
       console.error('Erreur:', error);
+      setThemes(prev => ({ ...prev, [chamberId]: [] }));
     }
   };
 
@@ -394,9 +398,11 @@ const CoursSupremeViewer = ({ embedded = false }) => {
     try {
       const response = await fetch(`http://localhost:5001/api/coursupreme/themes/${themeId}/decisions`);
       const data = await response.json();
-      setDecisions(prev => ({ ...prev, [themeId]: data.decisions }));
+      const themeDecisions = Array.isArray(data?.decisions) ? data.decisions : [];
+      setDecisions(prev => ({ ...prev, [themeId]: themeDecisions }));
     } catch (error) {
       console.error('Erreur:', error);
+      setDecisions(prev => ({ ...prev, [themeId]: [] }));
     }
   };
 
@@ -679,7 +685,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
           </div>
         ) : (
           <div className="space-y-3">
-            {chambers.map((chamber) => (
+            {safeChambers.map((chamber) => (
               <div key={chamber.id} className="bg-white rounded-lg shadow-sm">
                 <button onClick={() => toggleChamber(chamber.id)} className="w-full px-6 py-4 flex items-center justify-between hover:bg-gray-50">
                   <div className="flex items-center gap-3">

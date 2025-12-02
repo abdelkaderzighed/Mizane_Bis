@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Vérifie et répare les statuts de téléchargement, extraction et embedding."""
+"""Vérifie et répare les statuts de téléchargement, extraction et embedding (Postgres)."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -14,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "backend"))
 
 from backend.modules.joradp import routes as joradp_routes
+from backend.shared.postgres import get_connection as get_pg_connection
 
 
 def _normalize_status(status: str | None) -> str:
@@ -22,94 +22,93 @@ def _normalize_status(status: str | None) -> str:
     return str(status).strip().lower()
 
 
-def _has_embedding(cursor: sqlite3.Cursor, document_id: int, extra_metadata: str | None) -> bool:
-    if extra_metadata:
-        try:
-            payload = json.loads(extra_metadata)
-        except json.JSONDecodeError:
-            payload = {}
-        else:
-            embedding = payload.get("embedding")
-            if isinstance(embedding, dict):
-                vector = embedding.get("vector")
-                if isinstance(vector, list) and vector:
-                    return True
-
+def _has_embedding(cursor, document_id: int) -> bool:
     cursor.execute(
-        "SELECT 1 FROM document_embeddings WHERE document_id = ? LIMIT 1",
+        """
+        SELECT extra_metadata
+        FROM document_ai_metadata
+        WHERE document_id = %s
+          AND corpus = 'joradp'
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
         (document_id,),
     )
-    return cursor.fetchone() is not None
+    row = cursor.fetchone()
+    if not row or not row.get('extra_metadata'):
+        return False
+    extra = row['extra_metadata']
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except json.JSONDecodeError:
+            return False
+    embedding = extra.get('embedding') if isinstance(extra, dict) else None
+    if isinstance(embedding, dict):
+        vector = embedding.get('vector')
+        if isinstance(vector, list) and vector:
+            return True
+    return False
 
 
 def repair_statuses(limit: int | None = None, apply: bool = False, verbose: bool = False) -> tuple[int, int, int]:
-    joradp_routes._ensure_documents_status_columns()
+    processed = 0
+    candidates = 0
+    applied = 0
 
-    conn = joradp_routes.get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
+    with get_pg_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
             SELECT
                 id,
-                file_path,
-                text_path,
+                file_path_r2,
+                text_path_r2,
                 download_status,
                 text_extraction_status,
-                embedding_status,
-                extra_metadata
-            FROM documents
-            ORDER BY id
-        """)
-
-        rows = cursor.fetchall()
-        processed = 0
-        candidates = 0
-        applied = 0
+                embedding_status
+            FROM joradp_documents
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
 
         for row in rows:
             if limit is not None and processed >= limit:
                 break
             processed += 1
 
-            document_id = row["id"]
+            document_id = row['id']
             joradp_routes._r2_exists.cache_clear()
-            file_exists = bool(row["file_path"]) and joradp_routes._r2_exists(row["file_path"])
-            text_exists = bool(row["text_path"]) and joradp_routes._r2_exists(row["text_path"])
-            embedding_exists = _has_embedding(cursor, document_id, row["extra_metadata"])
+            file_exists = bool(row['file_path_r2']) and joradp_routes._r2_exists(row['file_path_r2'])
+            text_exists = bool(row['text_path_r2']) and joradp_routes._r2_exists(row['text_path_r2'])
+            embedding_exists = _has_embedding(cur, document_id)
 
-            updates: list[str] = []
+            updates = []
+            download_status = _normalize_status(row['download_status'])
+            text_status = _normalize_status(row['text_extraction_status'])
+            embedding_status = _normalize_status(row['embedding_status'])
 
-            download_status = _normalize_status(row["download_status"])
-            if file_exists and download_status != "success":
+            if file_exists and download_status != 'success':
                 updates.append("download_status = 'success'")
-
-            text_status = _normalize_status(row["text_extraction_status"])
-            if text_exists and text_status != "success":
+            if text_exists and text_status != 'success':
                 updates.append("text_extraction_status = 'success'")
-
-            embedding_status = _normalize_status(row["embedding_status"])
-            if embedding_exists and embedding_status != "success":
+            if embedding_exists and embedding_status != 'success':
                 updates.append("embedding_status = 'success'")
 
             if updates:
                 candidates += 1
                 if verbose:
-                    print(
-                        f"Document {document_id}: "
-                        f"download_status {download_status} -> {'success' if file_exists else download_status}, "
-                        f"text_extraction_status {text_status} -> {'success' if text_exists else text_status}, "
-                        f"embedding_status {embedding_status} -> {'success' if embedding_exists else embedding_status}"
-                    )
+                    print(f"Document {document_id}: corrections -> {', '.join(updates)}")
                 if apply:
-                    cursor.execute(
-                        f"UPDATE documents SET {', '.join(updates)} WHERE id = ?",
+                    cur.execute(
+                        f"UPDATE joradp_documents SET {', '.join(updates)}, error_log = NULL WHERE id = %s",
                         (document_id,),
                     )
-                    conn.commit()
                     applied += 1
-        return processed, candidates, applied
-    finally:
-        conn.close()
+        if apply:
+            conn.commit()
+
+    return processed, candidates, applied
 
 
 def main() -> None:
