@@ -429,7 +429,7 @@ const HierarchicalView = () => {
           url: doc.url,
           file_path: doc.file_path_r2,
           text_path: doc.text_path_r2,
-          date: formatDate(doc.publication_date),
+          date: doc.date, // Année seule (AAAA) depuis le backend
           numero: doc.id,
           similarity: doc.score ?? null,
           publication_date: formatDate(doc.publication_date),
@@ -469,7 +469,7 @@ const HierarchicalView = () => {
             documents: (data.documents || []).map(doc => ({
               ...doc,
               publication_date: formatDate(doc.publication_date),
-              date: formatDate(doc.publication_date),
+              // date contient déjà l'année seule (AAAA) depuis le backend
               statuts: normalizeDocStatuts(doc.statuts || {})
             }))
           };

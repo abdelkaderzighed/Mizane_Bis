@@ -105,8 +105,8 @@ def normalize_key(raw_path: Optional[str]) -> Optional[str]:
 
 def build_public_url(raw_path: Optional[str]) -> Optional[str]:
     """
-    Ensure we always return a fully-qualified URL that points to R2.
-    When the path already contains an URL, it is returned as-is.
+    Ensure we always return a fully-qualified URL that points to R2 public endpoint.
+    When the path contains an R2 storage URL, extract the key and rebuild with public URL.
     """
     if not raw_path:
         return None
@@ -115,10 +115,20 @@ def build_public_url(raw_path: Optional[str]) -> Optional[str]:
     if not raw:
         return None
 
-    if raw.startswith("http://") or raw.startswith("https://"):
-        return raw
-
     base_url = get_base_url()
+
+    # If it's already a URL, extract the key and rebuild with public URL
+    if raw.startswith("http://") or raw.startswith("https://"):
+        # Check if it's already using the public base URL
+        if raw.startswith(base_url):
+            return raw  # Already correct
+        # Otherwise, extract key and rebuild
+        key = normalize_key(raw)
+        if not key:
+            return None
+        return f"{base_url}/{key}"
+
+    # For relative paths
     key = normalize_key(raw)
     if not key:
         return None

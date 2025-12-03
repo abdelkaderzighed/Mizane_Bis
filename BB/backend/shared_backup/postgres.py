@@ -11,4 +11,18 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
 
-from shared.postgres import *  # noqa: F401, F403
+from shared.postgres import (
+    PostgresConfigurationError,
+    get_pool,
+    get_connection,
+    get_connection_simple,
+    close_pool,
+)
+
+__all__ = [
+    'PostgresConfigurationError',
+    'get_pool',
+    'get_connection',
+    'get_connection_simple',
+    'close_pool',
+]

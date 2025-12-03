@@ -289,11 +289,12 @@ def _clear_r2_exists_cache():
 
 def build_r2_url(raw_path: str | None) -> str | None:
     """
-    Retourne une URL R2 (pré-signée si possible) pour le chemin donné.
+    Retourne une URL R2 pré-signée pour l'accès au fichier.
     """
     if not raw_path:
         return None
-    return generate_presigned_url(raw_path)
+    # Toujours utiliser une URL presignée pour l'accès direct aux fichiers
+    return generate_presigned_url(raw_path, expires_in=3600)
 
 
 def _derive_pdf_key(file_path: str | None, url: str) -> str:
@@ -831,8 +832,9 @@ def get_session_documents(session_id):
         params = [session_id]
 
         if year:
-            where_clauses.append("d.url ILIKE %s")
-            params.append(f'%F{year}%')
+            # Pattern strict: /FYYYY suivi de 3 chiffres (numéro) puis .pdf
+            where_clauses.append("d.url ~ %s")
+            params.append(f'/F{year}[0-9]{{3}}\\.pdf$')
         if date_debut:
             where_clauses.append('d.publication_date >= %s')
             params.append(date_debut)
@@ -1332,10 +1334,18 @@ def semantic_search():
         score = float(np.dot(query_vec, item["vector"])) / (
             np.linalg.norm(query_vec) * np.linalg.norm(item["vector"])
         )
+        # Extraire l'année depuis l'URL (format: .../FYYYYNNN.pdf)
+        url = item["url"] or ""
+        filename = url.split('/')[-1]
+        year_str = None
+        if len(filename) >= 8 and filename.startswith('F') and filename[1:5].isdigit():
+            year_str = filename[1:5]
+
         scored.append(
             {
                 "id": item["id"],
                 "url": item["url"],
+                "date": year_str,
                 "publication_date": _serialize_date(item["publication_date"]),
                 "file_path_r2": item["file_path_r2"],
                 "text_path_r2": item["text_path_r2"],

@@ -1,7 +1,11 @@
 import os
+import sys
+from pathlib import Path
+
+# Add project root to Python path for shared module
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from dotenv import load_dotenv
-from pathlib import Path
 from flask import Flask, jsonify
 from flask_cors import CORS
 
