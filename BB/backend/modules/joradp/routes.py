@@ -895,8 +895,16 @@ def get_session_documents(session_id):
             url = row['url'] or ''
             filename = url.split('/')[-1]
             numero = filename[5:8] if len(filename) >= 8 else ''
+
+            # Extraire l'année depuis publication_date (prioritaire) ou depuis l'URL en fallback
             year_str = None
-            if len(filename) >= 8 and filename.startswith('F') and filename[1:5].isdigit():
+            if row['publication_date']:
+                try:
+                    year_str = str(row['publication_date'].year)
+                except (AttributeError, ValueError):
+                    pass
+            # Fallback sur l'année dans l'URL si pas de publication_date
+            if not year_str and len(filename) >= 8 and filename.startswith('F') and filename[1:5].isdigit():
                 year_str = filename[1:5]
 
             file_exists = bool(row['file_path_r2'])
@@ -1334,12 +1342,27 @@ def semantic_search():
         score = float(np.dot(query_vec, item["vector"])) / (
             np.linalg.norm(query_vec) * np.linalg.norm(item["vector"])
         )
-        # Extraire l'année depuis l'URL (format: .../FYYYYNNN.pdf)
-        url = item["url"] or ""
-        filename = url.split('/')[-1]
+
+        # Extraire l'année depuis publication_date (prioritaire) ou depuis l'URL en fallback
         year_str = None
-        if len(filename) >= 8 and filename.startswith('F') and filename[1:5].isdigit():
-            year_str = filename[1:5]
+        pub_date = item.get("publication_date")
+        if pub_date:
+            try:
+                # Si c'est une date, extraire l'année
+                if hasattr(pub_date, 'year'):
+                    year_str = str(pub_date.year)
+                # Si c'est une string YYYY-MM-DD
+                elif isinstance(pub_date, str) and len(pub_date) >= 4:
+                    year_str = pub_date[:4]
+            except (AttributeError, ValueError):
+                pass
+
+        # Fallback sur l'année dans l'URL si pas de publication_date
+        if not year_str:
+            url = item["url"] or ""
+            filename = url.split('/')[-1]
+            if len(filename) >= 8 and filename.startswith('F') and filename[1:5].isdigit():
+                year_str = filename[1:5]
 
         scored.append(
             {
