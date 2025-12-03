@@ -12,6 +12,7 @@ import os
 import io
 import zipfile
 import time
+import json
 from html import unescape
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -373,7 +374,11 @@ if str(HARVESTERS_DIR) not in sys.path:
 def _build_access_url(raw_path: str | None) -> str | None:
     if not raw_path:
         return None
-    return generate_presigned_url(raw_path) or build_public_url(raw_path)
+    try:
+        return generate_presigned_url(raw_path) or build_public_url(raw_path)
+    except R2ConfigurationError:
+        # R2 not configured: caller will fall back to any in-DB HTML content
+        return None
 
 
 def _fetch_text_from_r2(raw_path: str | None, fallback: str | None = None) -> str | None:
@@ -388,6 +393,41 @@ def _fetch_text_from_r2(raw_path: str | None, fallback: str | None = None) -> st
     except Exception as exc:
         print(f"⚠️ Impossible de charger {raw_path}: {exc}")
     return fallback
+
+
+def _decode_text(value):
+    """Convert memoryview/bytes to utf-8 string for JSON responses."""
+    if value is None:
+        return None
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode('utf-8', errors='ignore')
+        except Exception:
+            return value.decode('latin-1', errors='ignore')
+    return value
+
+
+def _decode_row_strings(row: dict) -> dict:
+    """Decode any memoryview/bytes values in a DB row."""
+    if not isinstance(row, dict):
+        return row
+    for key, value in list(row.items()):
+        if isinstance(value, (memoryview, bytes, bytearray)):
+            row[key] = _decode_text(value)
+    return row
+
+
+def _serialize_entities(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, (list, dict)):
+        try:
+            return json.dumps(raw, ensure_ascii=False)
+        except Exception:
+            return str(raw)
+    return raw
 
 
 def _delete_r2_object(raw_path: str | None) -> bool:
@@ -495,8 +535,7 @@ def get_decisions(theme_id):
     try:
         with get_pg_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
+                primary_sql = f"""
                     SELECT DISTINCT
                         d.id,
                         d.decision_number,
@@ -513,16 +552,39 @@ def get_decisions(theme_id):
                     JOIN supreme_court_decision_classifications c ON d.id = c.decision_id
                     WHERE c.theme_id = %s
                     ORDER BY d.decision_date DESC NULLS LAST, d.id DESC
-                    """,
-                    (theme_id,),
-                )
-                rows = cur.fetchall()
+                """
+                fallback_sql = f"""
+                    SELECT DISTINCT
+                        d.id,
+                        d.decision_number,
+                        d.decision_date,
+                        d.object_ar,
+                        d.object_fr,
+                        d.url,
+                        d.download_status,
+                        d.file_path_ar AS file_path_ar_r2,
+                        d.file_path_fr AS file_path_fr_r2,
+                        d.html_content_ar AS html_content_ar_r2,
+                        d.html_content_fr AS html_content_fr_r2
+                    FROM supreme_court_decisions d
+                    JOIN supreme_court_decision_classifications c ON d.id = c.decision_id
+                    WHERE c.theme_id = %s
+                    ORDER BY d.decision_date DESC NULLS LAST, d.id DESC
+                """
+                try:
+                    cur.execute(primary_sql, (theme_id,))
+                    rows = cur.fetchall()
+                except Exception as exc:
+                    conn.rollback()
+                    print(f"⚠️ Fallback to legacy columns for theme {theme_id}: {exc}")
+                    cur.execute(fallback_sql, (theme_id,))
+                    rows = cur.fetchall()
 
         decisions = []
         for row in rows:
-            row = dict(row)
-            html_ar = row.pop('html_content_ar_r2', None)
-            html_fr = row.pop('html_content_fr_r2', None)
+            row = _decode_row_strings(dict(row))
+            html_ar = _decode_text(row.pop('html_content_ar_r2', None))
+            html_fr = _decode_text(row.pop('html_content_fr_r2', None))
             row['content_ar'] = _fetch_text_from_r2(row.get('file_path_ar_r2'), html_ar)
             row['content_fr'] = _fetch_text_from_r2(row.get('file_path_fr_r2'), html_fr)
             row.pop('file_path_ar_r2', None)
@@ -548,10 +610,8 @@ def get_decision(decision_id):
                         d.arguments_r2, d.analysis_ar_r2, d.analysis_fr_r2,
                         d.legal_reference_ar, d.legal_reference_fr,
                         d.parties_ar, d.parties_fr,
-                        d.court_response_ar, d.court_response_fr,
                         d.president, d.rapporteur,
-                        d.title_ar, d.title_fr, d.summary_ar, d.summary_fr,
-                        d.entities_ar, d.entities_fr
+                        d.title_ar, d.title_fr
                     FROM supreme_court_decisions d
                     WHERE d.id = %s
                     """,
@@ -573,43 +633,66 @@ def get_decision(decision_id):
             return jsonify(decision)
         return jsonify({'error': 'Not found'}), 404
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@coursupreme_bp.route('/metadata/<int:decision_id>', methods=['GET'])
+        return 
+    jsonify({'error': str(e)}), 500
+@coursupreme_bp.route('/metadata/<int:decision_id>', methods=['GET'])   
 def get_metadata(decision_id):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT decision_number, decision_date,
-                   summary_ar, summary_fr, title_ar, title_fr,
-                   entities_ar, entities_fr,
-                   file_path_ar, file_path_fr,
-                   html_content_ar, html_content_fr
-            FROM supreme_court_decisions WHERE id = ?
-        """, (decision_id,))
-        row = cursor.fetchone()
-        conn.close()
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        d.decision_number,
+                        d.decision_date,
+                        d.file_path_ar_r2,
+                        d.file_path_fr_r2,
+                        d.html_content_ar_r2,
+                        d.html_content_fr_r2,
+                        ai_ar.title AS title_ar,
+                        ai_fr.title AS title_fr,
+                        ai_ar.summary AS summary_ar,
+                        ai_fr.summary AS summary_fr,
+                        ai_ar.keywords AS keywords_ar,
+                        ai_fr.keywords AS keywords_fr,
+                        ai_ar.entities AS entities_ar,
+                        ai_fr.entities AS entities_fr,
+                        ai_ar.publication_date,
+                        ai_ar.extra_metadata AS extra_metadata_ar,
+                        ai_fr.extra_metadata AS extra_metadata_fr
+                    FROM supreme_court_decisions d
+                    LEFT JOIN document_ai_metadata ai_ar 
+                        ON ai_ar.document_id = d.id 
+                        AND ai_ar.corpus = 'cour_supreme' 
+                        AND ai_ar.language = 'ar'
+                    LEFT JOIN document_ai_metadata ai_fr 
+                        ON ai_fr.document_id = d.id 
+                        AND ai_fr.corpus = 'cour_supreme' 
+                        AND ai_fr.language = 'fr'
+                    WHERE d.id = %s
+                    """,
+                    (decision_id,),
+                )
+                row = cur.fetchone()
+
         if row:
-            decision = dict(row)
-            
-            # Lire les contenus depuis les fichiers texte
-            html_ar = decision.pop('html_content_ar', None)
-            html_fr = decision.pop('html_content_fr', None)
-            decision['content_ar'] = _fetch_text_from_r2(decision.get('file_path_ar'), html_ar)
-            decision['content_fr'] = _fetch_text_from_r2(decision.get('file_path_fr'), html_fr)
-            
+            metadata = dict(row)
+
+            # Lire les contenus depuis R2
+            html_ar = metadata.pop('html_content_ar_r2', None)
+            html_fr = metadata.pop('html_content_fr_r2', None)
+            metadata['content_ar'] = _fetch_text_from_r2(metadata.get('file_path_ar_r2'), html_ar)
+            metadata['content_fr'] = _fetch_text_from_r2(metadata.get('file_path_fr_r2'), html_fr)
+
             # Nettoyer les champs inutiles
-            decision.pop('html_content_ar', None)
-            decision.pop('html_content_fr', None)
-            decision.pop('file_path_ar', None)
-            decision.pop('file_path_fr', None)
-            
-            return jsonify(decision)
+            metadata.pop('file_path_ar_r2', None)
+            metadata.pop('file_path_fr_r2', None)
+
+            return jsonify(metadata)
         return jsonify({'error': 'Not found'}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+ 
 
 @coursupreme_bp.route('/search', methods=['GET'])
 def search():
@@ -1900,8 +1983,9 @@ def file_exists(path):
 
 def load_html_content(in_memory_html, file_path):
     """Retourner le contenu HTML depuis la base ou depuis R2."""
-    if in_memory_html:
-        return in_memory_html
+    decoded = _decode_text(in_memory_html)
+    if decoded:
+        return decoded
     if not file_path:
         return None
     return _fetch_text_from_r2(file_path)
