@@ -6,13 +6,12 @@ import os
 from harvester_joradp_incremental import JORADPIncrementalHarvester
 
 def get_db_connection():
-    """Connexion à PostgreSQL (MizaneDb)"""
-    conn = psycopg2.connect(
-        os.getenv('DATABASE_URL', 
-                  'postgresql://postgres:Piano_2025_Sup@db.pxcwsfnuvmowlvtycslc.supabase.co:5432/postgres'),
-        cursor_factory=RealDictCursor
-    )
-    return conn
+    """Connexion à PostgreSQL (MizaneDb) via shared module"""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+    from shared.postgres import get_connection_simple
+    return get_connection_simple()
 
 def register_harvest_routes(app):
     

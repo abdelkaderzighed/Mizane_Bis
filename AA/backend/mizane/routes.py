@@ -16,7 +16,12 @@ import requests
 from psycopg2.extras import RealDictCursor, register_default_json, register_default_jsonb
 from flask import Blueprint, jsonify, request
 from sentence_transformers import SentenceTransformer
-from ..r2_storage import build_public_url, generate_presigned_url, get_r2_session
+import sys
+from pathlib import Path
+# Add project root to path to import from shared/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+from shared.r2_storage import build_public_url, generate_presigned_url, get_r2_session
+from shared.postgres import get_connection_simple
 
 mizane_bp = Blueprint("mizane", __name__)
 
@@ -26,9 +31,6 @@ register_default_jsonb(loads=json.loads, globally=True)
 
 DEFAULT_LIMIT = 20
 _R2_SESSION = get_r2_session()
-DB_DSN = os.getenv("MIZANE_DB_URL") or os.getenv("DATABASE_URL")
-if not DB_DSN:
-    raise RuntimeError("Configure MIZANE_DB_URL (ou DATABASE_URL) pour accéder à MizaneDb.")
 
 VALID_SORT_FIELDS = {"date", "year", "number"}
 VALID_SORT_ORDER = {"asc", "desc"}
@@ -102,7 +104,8 @@ def _persist_cache_to_disk(corpus: str, items: List[Dict[str, Any]]):
 
 
 def get_connection():
-    return psycopg2.connect(DB_DSN, cursor_factory=RealDictCursor)
+    """Wrapper for backward compatibility."""
+    return get_connection_simple()
 
 
 def _split_keywords(param: str) -> list[str]:
