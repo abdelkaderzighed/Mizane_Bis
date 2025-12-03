@@ -41,6 +41,16 @@ const normalizeDocStatuts = (statuts = {}) => ({
   embedded: statusToTriState(statuts.embedded),
 });
 
+const formatDate = (value) => {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const day = String(date.getDate()).padStart(2, '0');
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const year = date.getFullYear();
+  return `${day}/${month}/${year}`;
+};
+
 const HierarchicalView = () => {
   const [sites, setSites] = useState([]);
   const [coursupremeExpanded, setCoursupremeExpanded] = useState(false);
@@ -110,6 +120,7 @@ const HierarchicalView = () => {
     filter_languages: ''
   });
   const [sessionsData, setSessionsData] = useState({});
+  const [harvestLoading, setHarvestLoading] = useState({});
 
   useEffect(() => {
     loadSites();
@@ -418,10 +429,10 @@ const HierarchicalView = () => {
           url: doc.url,
           file_path: doc.file_path_r2,
           text_path: doc.text_path_r2,
-          date: doc.publication_date || '-',
+          date: formatDate(doc.publication_date),
           numero: doc.id,
           similarity: doc.score ?? null,
-          publication_date: doc.publication_date || '-',
+          publication_date: formatDate(doc.publication_date),
           statuts: { collected: true, downloaded: true, analyzed: true }
         }));
         const normalizedData = {
@@ -457,6 +468,8 @@ const HierarchicalView = () => {
             ...data,
             documents: (data.documents || []).map(doc => ({
               ...doc,
+              publication_date: formatDate(doc.publication_date),
+              date: formatDate(doc.publication_date),
               statuts: normalizeDocStatuts(doc.statuts || {})
             }))
           };
@@ -598,6 +611,7 @@ const HierarchicalView = () => {
   };
 
   const executeAdvancedHarvest = async () => {
+    setHarvestLoading(prev => ({ ...prev, [advancedHarvestSessionId]: true }));
     let mode = 'depuis_dernier';
     const params = {};
     
@@ -620,10 +634,12 @@ const HierarchicalView = () => {
     
     await incrementalHarvest(advancedHarvestSessionId, mode, params);
     setShowAdvancedHarvestModal(false);
+    setHarvestLoading(prev => ({ ...prev, [advancedHarvestSessionId]: false }));
   };
 
   const incrementalHarvest = async (sessionId, mode, params = {}) => {
     try {
+      setHarvestLoading(prev => ({ ...prev, [sessionId]: true }));
       const res = await fetch(`${API_URL}/harvest/${sessionId}/incremental`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -646,8 +662,9 @@ const HierarchicalView = () => {
         alert(data.error || 'Erreur moissonnage');
       }
     } catch (err) {
-      
+      alert('Erreur réseau moissonnage');
     }
+    setHarvestLoading(prev => ({ ...prev, [sessionId]: false }));
   };
 
   const launchPhases = async (sessionId) => {
@@ -853,11 +870,22 @@ const HierarchicalView = () => {
                               <div className="relative">
                                 <button 
                                   onClick={() => setShowHarvestDropdown(prev => ({...prev, [session.id]: !prev[session.id]}))}
-                                className="flex items-center gap-1 px-2 py-1 bg-blue-500 text-white rounded text-xs hover:bg-blue-600">
-                                <RefreshCw size={12} />
-                                Moissonnage
-                                <ChevronDown size={10} />
-                              </button>
+                                  className="flex items-center gap-1 px-2 py-1 bg-blue-500 text-white rounded text-xs hover:bg-blue-600 disabled:opacity-60"
+                                  disabled={harvestLoading[session.id]}
+                                >
+                                  {harvestLoading[session.id] ? (
+                                    <span className="flex items-center gap-1">
+                                      <RefreshCw size={12} className="animate-spin" />
+                                      Moissonnage...
+                                    </span>
+                                  ) : (
+                                    <>
+                                      <RefreshCw size={12} />
+                                      Moissonnage
+                                      <ChevronDown size={10} />
+                                    </>
+                                  )}
+                                </button>
                               
                               {showHarvestDropdown[session.id] && (
                                 <div className="absolute top-full left-0 mt-1 bg-white border rounded shadow-lg z-10 w-48">

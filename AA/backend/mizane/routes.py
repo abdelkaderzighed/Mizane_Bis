@@ -7,6 +7,7 @@ from calendar import monthrange
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -36,6 +37,68 @@ _CS_EMBED_CACHE = None
 _JORADP_EMBED_CACHE = None
 _WARMED_UP = False
 _WARM_LOCK = False
+CACHE_DIR = os.getenv("EMBED_CACHE_DIR")
+
+
+def _get_cache_file(corpus: str) -> Path | None:
+    if not CACHE_DIR:
+        return None
+    try:
+        path = Path(CACHE_DIR).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path / f"{corpus}_embed_cache_v1.json"
+    except Exception:
+        return None
+
+
+def _load_cache_from_disk(corpus: str):
+    cache_file = _get_cache_file(corpus)
+    if not cache_file or not cache_file.exists():
+        return None
+    try:
+        with cache_file.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        items = []
+        for raw in payload.get("items", []):
+            vec = raw.get("vector")
+            if vec is None:
+                continue
+            arr = np.array(vec, dtype=np.float32)
+            if arr.size == 0:
+                continue
+            norm = np.linalg.norm(arr)
+            if norm == 0:
+                continue
+            arr = arr / norm
+            raw["vector"] = arr
+            items.append(raw)
+        return items
+    except Exception:
+        return None
+
+
+def _persist_cache_to_disk(corpus: str, items: List[Dict[str, Any]]):
+    cache_file = _get_cache_file(corpus)
+    if not cache_file:
+        return
+    try:
+        serializable: List[Dict[str, Any]] = []
+        for row in items:
+            vec = row.get("vector")
+            if vec is None:
+                continue
+            serializable.append(
+                {
+                    **{k: v for k, v in row.items() if k != "vector"},
+                    "vector": vec.tolist() if isinstance(vec, np.ndarray) else vec,
+                }
+            )
+        tmp_path = cache_file.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump({"items": serializable, "created_at": datetime.utcnow().isoformat()}, f)
+        tmp_path.replace(cache_file)
+    except Exception:
+        return
 
 
 def get_connection():
@@ -198,6 +261,10 @@ def _load_cour_supreme_embeddings_cache():
     global _CS_EMBED_CACHE
     if _CS_EMBED_CACHE is not None:
         return _CS_EMBED_CACHE
+    disk_cache = _load_cache_from_disk("cour_supreme")
+    if disk_cache is not None:
+        _CS_EMBED_CACHE = disk_cache
+        return _CS_EMBED_CACHE
     _warm_cache_async()
 
     cache: List[Dict[str, Any]] = []
@@ -249,12 +316,17 @@ def _load_cour_supreme_embeddings_cache():
                 cache.append(item)
 
     _CS_EMBED_CACHE = cache
+    _persist_cache_to_disk("cour_supreme", cache)
     return _CS_EMBED_CACHE
 
 
 def _load_joradp_embeddings_cache():
     global _JORADP_EMBED_CACHE
     if _JORADP_EMBED_CACHE is not None:
+        return _JORADP_EMBED_CACHE
+    disk_cache = _load_cache_from_disk("joradp")
+    if disk_cache is not None:
+        _JORADP_EMBED_CACHE = disk_cache
         return _JORADP_EMBED_CACHE
     _warm_cache_async()
 
@@ -300,6 +372,7 @@ def _load_joradp_embeddings_cache():
                 cache.append(item)
 
     _JORADP_EMBED_CACHE = cache
+    _persist_cache_to_disk("joradp", cache)
     return _JORADP_EMBED_CACHE
 
 

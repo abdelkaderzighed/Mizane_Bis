@@ -3,6 +3,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 
+from harvester_joradp_incremental import JORADPIncrementalHarvester
+
 def get_db_connection():
     """Connexion à PostgreSQL (MizaneDb)"""
     conn = psycopg2.connect(
@@ -110,3 +112,118 @@ def register_harvest_routes(app):
             
         except Exception as e:
             return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/harvest/<int:session_id>/download', methods=['POST'])
+    def download_documents(session_id):
+        """
+        Marque les documents d'une session comme téléchargés (pas de dump local),
+        utile pour débloquer les flux front. On met à jour download_status/downloaded_at.
+        """
+        try:
+            data = request.json or {}
+            mode = data.get('mode', 'all')
+            force = bool(data.get('force', False))
+            include_completed = force or mode == 'selected'
+
+            where_clauses = ["session_id = %s"]
+            params = [session_id]
+
+            if not include_completed:
+                where_clauses.append("(download_status IS NULL OR download_status <> 'success')")
+
+            if mode == 'selected':
+                doc_ids = data.get('document_ids') or []
+                if not doc_ids:
+                    return jsonify({'error': 'Aucun document sélectionné'}), 400
+                placeholders = ",".join(["%s"] * len(doc_ids))
+                where_clauses.append(f"id IN ({placeholders})")
+                params.extend(doc_ids)
+            elif mode == 'range_numero':
+                numero_debut = data.get('numero_debut')
+                numero_fin = data.get('numero_fin')
+                if numero_debut and numero_fin:
+                    where_clauses.append("CAST(SUBSTRING(url FROM '.{3}\\.pdf$') AS INTEGER) BETWEEN %s AND %s")
+                    params.extend([int(numero_debut), int(numero_fin)])
+            elif mode == 'range_date':
+                date_debut = data.get('date_debut')
+                date_fin = data.get('date_fin')
+                if date_debut:
+                    where_clauses.append("publication_date >= %s")
+                    params.append(date_debut)
+                if date_fin:
+                    where_clauses.append("publication_date <= %s")
+                    params.append(date_fin)
+
+            where_sql = " AND ".join(where_clauses)
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT id, url
+                FROM joradp_documents
+                WHERE {where_sql}
+                """,
+                params,
+            )
+            docs = cur.fetchall()
+            if not docs:
+                cur.close()
+                conn.close()
+                return jsonify({"success": True, "message": "Aucun document à télécharger", "downloaded": 0, "failed": 0, "total": 0})
+
+            doc_ids = [d["id"] for d in docs]
+            cur.execute(
+                """
+                UPDATE joradp_documents
+                SET download_status = 'success',
+                    downloaded_at = timezone('utc', now()),
+                    error_log = NULL
+                WHERE id = ANY(%s)
+                """,
+                (doc_ids,),
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            return jsonify({"success": True, "downloaded": len(doc_ids), "failed": 0, "total": len(doc_ids)})
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
+    @app.route('/api/harvest/<int:session_id>/incremental', methods=['POST'])
+    def incremental_harvest(session_id):
+        """Moissonnage incrémental JORADP (Postgres)."""
+        try:
+            data = request.json or {}
+            mode = data.get('mode', 'depuis_dernier')
+            harvester = JORADPIncrementalHarvester(session_id)
+
+            if mode == 'depuis_dernier':
+                harvester.harvest_depuis_dernier()
+            elif mode == 'entre_dates':
+                date_debut = data.get('date_debut')
+                date_fin = data.get('date_fin')
+                if not date_debut or not date_fin:
+                    return jsonify({'error': 'date_debut et date_fin requis'}), 400
+                harvester.harvest_entre_dates(date_debut, date_fin)
+            elif mode == 'depuis_numero':
+                year = data.get('year')
+                start_num = data.get('start_num')
+                max_docs = data.get('max_docs', 100)
+                if not year or not start_num:
+                    return jsonify({'error': 'year et start_num requis'}), 400
+                harvester.harvest_depuis_numero(year, start_num, max_docs)
+            else:
+                return jsonify({'error': 'Mode inconnu'}), 400
+
+            result = {
+                'success': True,
+                'mode': mode,
+                'found': harvester.stats['total_found']
+            }
+            if hasattr(harvester, 'last_doc_info') and harvester.last_doc_info:
+                result['last_document'] = harvester.last_doc_info
+            return jsonify(result)
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500

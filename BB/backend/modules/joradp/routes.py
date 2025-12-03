@@ -42,6 +42,14 @@ _EMBEDDING_MODEL = None
 _EMBED_CACHE = None
 
 
+def _serialize_date(value):
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
 def get_embedding_model():
     global _EMBEDDING_MODEL
     if _EMBEDDING_MODEL is None:
@@ -109,7 +117,7 @@ def _load_embeddings_cache():
         return {
             "id": row["id"],
             "url": row["url"],
-            "publication_date": row["publication_date"],
+            "publication_date": _serialize_date(row["publication_date"]),
             "file_path_r2": row["file_path_r2"],
             "text_path_r2": row["text_path_r2"],
             "vector": vec,
@@ -519,7 +527,7 @@ def get_document_metadata(doc_id):
         elif named_entities:
             named_entities_str = str(named_entities)
 
-        publication_date = row.get('publication_date') or row.get('metadata_publication_date')
+        publication_date = _serialize_date(row.get('publication_date') or row.get('metadata_publication_date'))
         doc = {
             'id': row['id'],
             'url': row['url'],
@@ -897,7 +905,7 @@ def get_session_documents(session_id):
                     'url': row['url'],
                     'numero': numero,
                     'date': year_str,
-                    'publication_date': row['publication_date'],
+                    'publication_date': _serialize_date(row['publication_date']),
                     'size_kb': round((row['file_size_bytes'] or 0) / 1024, 1) if row['file_size_bytes'] else 0,
                     'file_path': row['file_path_r2'],
                     'text_path': row['text_path_r2'],
@@ -1118,7 +1126,10 @@ def export_selected_documents():
 def analyze_documents_batch(session_id):
     """Analyser les documents d'une session avec OpenAI IA (MizaneDb)."""
     try:
-        from openai import OpenAI
+        try:
+            from openai import OpenAI
+        except ImportError:
+            return jsonify({'error': "Le module 'openai' est manquant. Installez-le dans le venv backend (pip install openai>=1.0.0)."}), 500
         from analysis import get_embedding_model
 
         api_key = os.getenv('OPENAI_API_KEY')
@@ -1325,7 +1336,7 @@ def semantic_search():
             {
                 "id": item["id"],
                 "url": item["url"],
-                "publication_date": item["publication_date"],
+                "publication_date": _serialize_date(item["publication_date"]),
                 "file_path_r2": item["file_path_r2"],
                 "text_path_r2": item["text_path_r2"],
                 "score": round(score, 6),
@@ -1446,7 +1457,10 @@ def batch_extract_documents():
 def batch_analyze_documents():
     """Analyser plusieurs documents sélectionnés avec IA + embeddings (MizaneDb)."""
     try:
-        from openai import OpenAI
+        try:
+            from openai import OpenAI
+        except ImportError:
+            return jsonify({'error': "Le module 'openai' est manquant. Installez-le dans le venv backend (pip install openai>=1.0.0)."}), 500
         from analysis import get_embedding_model
 
         data = request.json or {}

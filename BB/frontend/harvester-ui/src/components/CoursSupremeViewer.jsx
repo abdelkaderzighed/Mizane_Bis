@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { ChevronDown, ChevronRight, FolderOpen, Tag, Eye, Globe, Download, Database, Trash2, Search } from 'lucide-react';
+import { ChevronDown, ChevronRight, FolderOpen, Tag, Eye, Globe, Download, Database, Trash2, Search, RefreshCw } from 'lucide-react';
+import { COURSUPREME_API_URL } from '../config';
 import DecisionStatusManager from './DecisionStatusManager';
 import ConfirmationModal from './ConfirmationModal';
 
@@ -31,6 +32,10 @@ const CoursSupremeViewer = ({ embedded = false }) => {
   const [metadataModalOpen, setMetadataModalOpen] = useState(false);
   const [selectedMetadata, setSelectedMetadata] = useState(null);
   const [metadataLang, setMetadataLang] = useState('ar');
+  const [selectAllLoading, setSelectAllLoading] = useState(false);
+  const [allDecisionIds, setAllDecisionIds] = useState(null);
+  const [incrementalHarvestLoading, setIncrementalHarvestLoading] = useState(false);
+  const [incrementalHarvestMessage, setIncrementalHarvestMessage] = useState('');
   const [batchModal, setBatchModal] = useState({
     isOpen: false,
     type: 'info',
@@ -45,6 +50,25 @@ const CoursSupremeViewer = ({ embedded = false }) => {
   const closeBatchModal = () => setBatchModal(prev => ({ ...prev, isOpen: false }));
   const safeChambers = Array.isArray(chambers) ? chambers : [];
 
+  const api = (path) => `${COURSUPREME_API_URL}${path}`;
+  const parseEntities = (raw) => {
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string') {
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    if (typeof raw === 'object') {
+      if (Array.isArray(raw.entities)) return raw.entities;
+      return [raw];
+    }
+    return [];
+  };
+
   useEffect(() => {
     fetchChambers();
   }, []);
@@ -58,12 +82,29 @@ const CoursSupremeViewer = ({ embedded = false }) => {
       newSelected.add(decisionId);
     }
     setSelectedDecisions(newSelected);
+    setSelectAllLoading(false);
   };
 
-  const toggleThemeSelection = (themeId, event) => {
+  const ensureThemesLoaded = async (chamberId) => {
+    if (themes[chamberId]) {
+      return themes[chamberId];
+    }
+    const loaded = await fetchThemes(chamberId);
+    return loaded || [];
+  };
+
+  const ensureDecisionsLoaded = async (themeId) => {
+    if (decisions[themeId]) {
+      return decisions[themeId];
+    }
+    const loaded = await fetchDecisions(themeId);
+    return loaded || [];
+  };
+
+  const toggleThemeSelection = async (themeId, event) => {
     event.stopPropagation();
+    const themeDecisions = await ensureDecisionsLoaded(themeId);
     const newSelected = new Set(selectedDecisions);
-    const themeDecisions = decisions[themeId] || [];
 
     // Vérifier si AU MOINS UNE décision du thème est sélectionnée
     const someSelected = themeDecisions.some(d => newSelected.has(d.id));
@@ -76,12 +117,17 @@ const CoursSupremeViewer = ({ embedded = false }) => {
       themeDecisions.forEach(d => newSelected.add(d.id));
     }
     setSelectedDecisions(newSelected);
+    setSelectAllLoading(false);
   };
 
-  const toggleChamberSelection = (chamberId, event) => {
+  const toggleChamberSelection = async (chamberId, event) => {
     event.stopPropagation();
+    const chamberThemes = await ensureThemesLoaded(chamberId);
+    // Charger les décisions manquantes avant la sélection en cascade
+    for (const theme of chamberThemes) {
+      await ensureDecisionsLoaded(theme.id);
+    }
     const newSelected = new Set(selectedDecisions);
-    const chamberThemes = themes[chamberId] || [];
     const allDecisions = chamberThemes.flatMap(theme => decisions[theme.id] || []);
 
     // Vérifier si AU MOINS UNE décision de la chambre est sélectionnée
@@ -95,6 +141,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
       allDecisions.forEach(d => newSelected.add(d.id));
     }
     setSelectedDecisions(newSelected);
+    setSelectAllLoading(false);
   };
 
   const formatBatchResult = (data, total, successLabel, fallback = 'Traitement terminé') => {
@@ -182,7 +229,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
     });
 
     try {
-      const response = await fetch(`http://localhost:5001/api/coursupreme/batch/${action}`, {
+      const response = await fetch(api(`/batch/${action}`), {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({decision_ids: ids, force})
@@ -273,31 +320,41 @@ const CoursSupremeViewer = ({ embedded = false }) => {
   };
 
   // Vérifier si un thème a au moins une décision sélectionnée
-  const isThemeSelected = (themeId) => {
-    const themeDecisions = decisions[themeId] || [];
-    if (themeDecisions.length === 0) return false;
-    // Checkbox cochée si TOUTES les décisions sont sélectionnées
-    return themeDecisions.every(d => selectedDecisions.has(d.id));
-  };
-
-  // Vérifier si une chambre a toutes ses décisions sélectionnées
-  const isChamberSelected = (chamberId) => {
+  const getThemeDecisionIds = (themeId) => (decisions[themeId] || []).map((d) => d.id);
+  const getChamberDecisionIds = (chamberId) => {
     const chamberThemes = themes[chamberId] || [];
-    if (chamberThemes.length === 0) return false;
-    const allDecisions = chamberThemes.flatMap(theme => decisions[theme.id] || []);
-    if (allDecisions.length === 0) return false;
-    // Checkbox cochée si TOUTES les décisions sont sélectionnées
-    return allDecisions.every(d => selectedDecisions.has(d.id));
+    const ids = new Set();
+    chamberThemes.forEach((theme) => {
+      getThemeDecisionIds(theme.id).forEach((id) => ids.add(id));
+    });
+    return Array.from(ids);
   };
 
-  // Vérifier si TOUTES les décisions sont sélectionnées
-  const areAllDecisionsSelected = () => {
-    const allDecisionIds = safeChambers.flatMap(chamber => {
-      const chamberThemes = themes[chamber.id] || [];
-      return chamberThemes.flatMap(theme => (decisions[theme.id] || []).map(d => d.id));
+  const getAllDecisionIds = () => {
+    if (allDecisionIds && allDecisionIds.length > 0) return allDecisionIds;
+    const ids = new Set();
+    safeChambers.forEach((chamber) => {
+      getChamberDecisionIds(chamber.id).forEach((id) => ids.add(id));
     });
-    if (allDecisionIds.length === 0) return false;
-    return allDecisionIds.every(id => selectedDecisions.has(id));
+    return Array.from(ids);
+  };
+
+  const isThemeSelected = (themeId) => {
+    const ids = getThemeDecisionIds(themeId);
+    if (ids.length === 0) return false;
+    return ids.every((id) => selectedDecisions.has(id));
+  };
+
+  const isChamberSelected = (chamberId) => {
+    const ids = getChamberDecisionIds(chamberId);
+    if (ids.length === 0) return false;
+    return ids.every((id) => selectedDecisions.has(id));
+  };
+
+  const areAllDecisionsSelected = () => {
+    const ids = getAllDecisionIds();
+    if (ids.length === 0) return false;
+    return ids.every((id) => selectedDecisions.has(id));
   };
 
   // Sélectionner ou désélectionner toutes les décisions
@@ -305,51 +362,42 @@ const CoursSupremeViewer = ({ embedded = false }) => {
     if (areAllDecisionsSelected()) {
       // Tout désélectionner
       setSelectedDecisions(new Set());
+      setSelectAllLoading(false);
     } else {
       // Charger toutes les données et sélectionner
       setBatchProcessing(true);
+      setSelectAllLoading(true);
       try {
-        const allDecisionIds = [];
-
-        // Pour chaque chambre
-        for (const chamber of safeChambers) {
-          // Charger les thèmes si pas déjà chargés
-          let chamberThemes = themes[chamber.id];
-          if (!chamberThemes) {
-            const response = await fetch(`http://localhost:5001/api/coursupreme/chambers/${chamber.id}/themes`);
-            const data = await response.json();
-            chamberThemes = data.themes;
-            setThemes(prev => ({ ...prev, [chamber.id]: chamberThemes }));
+        // Charger toutes les décisions (une seule fois)
+        if (!allDecisionIds || allDecisionIds.length === 0) {
+          const ids = [];
+          for (const chamber of safeChambers) {
+            const chamberThemes = await ensureThemesLoaded(chamber.id);
+            if (!chamberThemes || chamberThemes.length === 0) continue;
+            const decisionsLists = await Promise.all(
+              chamberThemes.map((theme) => ensureDecisionsLoaded(theme.id))
+            );
+            decisionsLists.forEach((list) => {
+              ids.push(...(list || []).map((d) => d.id));
+            });
           }
-
-          // Pour chaque thème de la chambre
-          for (const theme of chamberThemes || []) {
-            // Charger les décisions si pas déjà chargées
-            let themeDecisions = decisions[theme.id];
-            if (!themeDecisions) {
-              const response = await fetch(`http://localhost:5001/api/coursupreme/themes/${theme.id}/decisions`);
-              const data = await response.json();
-              themeDecisions = data.decisions;
-              setDecisions(prev => ({ ...prev, [theme.id]: themeDecisions }));
-            }
-
-            // Ajouter les IDs des décisions
-            allDecisionIds.push(...(themeDecisions || []).map(d => d.id));
-          }
+          const uniqueIds = Array.from(new Set(ids));
+          setAllDecisionIds(uniqueIds);
+          setSelectedDecisions(new Set(uniqueIds));
+        } else {
+          setSelectedDecisions(new Set(allDecisionIds));
         }
-
-        // Sélectionner toutes les décisions
-        setSelectedDecisions(new Set(allDecisionIds));
       } catch (error) {
         console.error('Erreur lors de la sélection:', error);
       }
       setBatchProcessing(false);
+      setSelectAllLoading(false);
     }
   };
 
   const fetchChambers = async () => {
     try {
-      const response = await fetch('http://localhost:5001/api/coursupreme/chambers');
+      const response = await fetch(api('/chambers'));
       const data = await response.json();
       setChambers(Array.isArray(data?.chambers) ? data.chambers : []);
       setLoading(false);
@@ -373,13 +421,15 @@ const CoursSupremeViewer = ({ embedded = false }) => {
 
   const fetchThemes = async (chamberId) => {
     try {
-      const response = await fetch(`http://localhost:5001/api/coursupreme/chambers/${chamberId}/themes`);
+      const response = await fetch(api(`/chambers/${chamberId}/themes`));
       const data = await response.json();
       const chamberThemes = Array.isArray(data?.themes) ? data.themes : [];
       setThemes(prev => ({ ...prev, [chamberId]: chamberThemes }));
+      return chamberThemes;
     } catch (error) {
       console.error('Erreur:', error);
       setThemes(prev => ({ ...prev, [chamberId]: [] }));
+      return [];
     }
   };
 
@@ -396,19 +446,21 @@ const CoursSupremeViewer = ({ embedded = false }) => {
 
   const fetchDecisions = async (themeId) => {
     try {
-      const response = await fetch(`http://localhost:5001/api/coursupreme/themes/${themeId}/decisions`);
+      const response = await fetch(api(`/themes/${themeId}/decisions`));
       const data = await response.json();
       const themeDecisions = Array.isArray(data?.decisions) ? data.decisions : [];
       setDecisions(prev => ({ ...prev, [themeId]: themeDecisions }));
+      return themeDecisions;
     } catch (error) {
       console.error('Erreur:', error);
       setDecisions(prev => ({ ...prev, [themeId]: [] }));
+      return [];
     }
   };
 
   const fetchDecisionDetail = async (id, decisionsList = null) => {
     try {
-      const response = await fetch(`http://localhost:5001/api/coursupreme/decisions/${id}`);
+      const response = await fetch(api(`/decisions/${id}`));
       const data = await response.json();
       setSelectedDecision(data);
       setModalOpen(true);
@@ -434,7 +486,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
   const handleSearch = async () => {
     if (!searchTerm.trim()) return;
     try {
-      const response = await fetch(`http://localhost:5001/api/coursupreme/search?q=${encodeURIComponent(searchTerm)}`);
+      const response = await fetch(api(`/search?q=${encodeURIComponent(searchTerm)}`));
       const data = await response.json();
       setSearchResults(data.results || []);
     } catch (error) {
@@ -451,7 +503,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
       if (filters.dateFrom) params.append('date_from', filters.dateFrom);
       if (filters.dateTo) params.append('date_to', filters.dateTo);
       
-      const response = await fetch(`http://localhost:5001/api/coursupreme/search/advanced?${params}`);
+      const response = await fetch(api(`/search/advanced?${params}`));
       const data = await response.json();
       setSearchResults(data.results || []);
     } catch (error) {
@@ -461,7 +513,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
 
   const handleDownloadDecision = async (id) => {
     try {
-      const response = await fetch(`http://localhost:5001/api/coursupreme/download/${id}`, {method: 'POST'});
+      const response = await fetch(api(`/download/${id}`), {method: 'POST'});
       const data = await response.json();
       alert(data.message || 'Téléchargement lancé');
     } catch (error) {
@@ -472,7 +524,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
   const handleDeleteDecision = async (id) => {
     if (!window.confirm('Supprimer?')) return;
     try {
-      await fetch(`http://localhost:5001/api/coursupreme/decisions/${id}`, {method: 'DELETE'});
+      await fetch(api(`/decisions/${id}`), {method: 'DELETE'});
       alert('Supprimée');
       fetchChambers();
     } catch (error) {
@@ -480,9 +532,34 @@ const CoursSupremeViewer = ({ embedded = false }) => {
     }
   };
 
+  const runIncrementalHarvest = async () => {
+    setIncrementalHarvestLoading(true);
+    setIncrementalHarvestMessage('');
+    try {
+      const res = await fetch(`${COURSUPREME_API_URL}/harvest/incremental-root`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setIncrementalHarvestMessage(data.error || 'Erreur moissonnage incrémental');
+      } else {
+        setIncrementalHarvestMessage(
+          `Moissonnage incrémental: ${data.inserted} insérés / ${data.found} trouvés (skip: ${data.skipped_existing}).`
+        );
+        fetchChambers();
+      }
+    } catch (error) {
+      setIncrementalHarvestMessage('Erreur réseau moissonnage incrémental');
+    } finally {
+      setIncrementalHarvestLoading(false);
+    }
+  };
+
   const handleShowMetadata = async (id) => {
     try {
-      const response = await fetch(`http://localhost:5001/api/coursupreme/metadata/${id}`);
+      const response = await fetch(api(`/metadata/${id}`));
       const data = await response.json();
       setSelectedMetadata(data);
       setMetadataModalOpen(true);
@@ -529,6 +606,20 @@ const CoursSupremeViewer = ({ embedded = false }) => {
                 Gestion des Décisions
               </button>
             </div>
+
+            <div className="flex justify-center mb-4">
+              <button
+                onClick={runIncrementalHarvest}
+                disabled={incrementalHarvestLoading}
+                className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-60"
+              >
+                <RefreshCw className={`w-4 h-4 ${incrementalHarvestLoading ? 'animate-spin' : ''}`} />
+                {incrementalHarvestLoading ? 'Moissonnage en cours...' : 'Moissonnage incrémental'}
+              </button>
+            </div>
+            {incrementalHarvestMessage && (
+              <p className="text-center text-sm text-gray-600 mb-4">{incrementalHarvestMessage}</p>
+            )}
 
             {activeTab === 'hierarchy' && (
             <>
@@ -593,61 +684,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
               )}
             </div>
 
-            {/* Panneau de sélection et actions groupées */}
-            <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-lg p-4 mb-4 shadow-sm">
-              <div className="flex items-center justify-between">
-                {/* Checkbox "Tout sélectionner" */}
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={areAllDecisionsSelected()}
-                    onChange={toggleSelectAll}
-                    className="w-5 h-5 text-blue-600 rounded cursor-pointer"
-                  />
-                  <span className="font-semibold text-blue-800 text-sm">
-                    Tout sélectionner
-                  </span>
-                </label>
-
-                {/* Boutons d'actions avec libellés */}
-                {selectedDecisions.size > 0 && (
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => handleBatchAction('download')}
-                      disabled={batchProcessing}
-                      className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 transition-all hover:scale-105 flex items-center gap-2 font-medium text-sm"
-                    >
-                      <span>📥</span>
-                      <span>Télécharger</span>
-                    </button>
-                    <button
-                      onClick={() => handleBatchAction('translate')}
-                      disabled={batchProcessing}
-                      className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-all hover:scale-105 flex items-center gap-2 font-medium text-sm"
-                    >
-                      <span>🌐</span>
-                      <span>Traduire</span>
-                    </button>
-                    <button
-                      onClick={() => handleBatchAction('analyze')}
-                      disabled={batchProcessing}
-                      className="px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50 transition-all hover:scale-105 flex items-center gap-2 font-medium text-sm"
-                    >
-                      <span>🤖</span>
-                      <span>Analyser</span>
-                    </button>
-                    <button
-                      onClick={() => handleBatchAction('embed')}
-                      disabled={batchProcessing}
-                      className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-all hover:scale-105 flex items-center gap-2 font-medium text-sm"
-                    >
-                      <span>🧬</span>
-                      <span>Embeddings</span>
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
+            {/* Panneau de sélection retiré */}
 
         {searchResults ? (
           <div className="bg-white rounded-lg shadow-sm p-6">
@@ -689,13 +726,6 @@ const CoursSupremeViewer = ({ embedded = false }) => {
               <div key={chamber.id} className="bg-white rounded-lg shadow-sm">
                 <button onClick={() => toggleChamber(chamber.id)} className="w-full px-6 py-4 flex items-center justify-between hover:bg-gray-50">
                   <div className="flex items-center gap-3">
-                    <input
-                      type="checkbox"
-                      checked={isChamberSelected(chamber.id)}
-                      onChange={(e) => toggleChamberSelection(chamber.id, e)}
-                      onClick={(e) => e.stopPropagation()}
-                      className="w-5 h-5 text-blue-600 rounded"
-                    />
                     {expandedChamber === chamber.id ? <ChevronDown /> : <ChevronRight />}
                     <FolderOpen className="text-purple-600" />
                     <div>
@@ -714,10 +744,7 @@ const CoursSupremeViewer = ({ embedded = false }) => {
                           <div className="flex items-center gap-3">
                             <input
                               type="checkbox"
-                              checked={isThemeSelected(theme.id)}
-                              onChange={(e) => toggleThemeSelection(theme.id, e)}
-                              onClick={(e) => e.stopPropagation()}
-                              className="w-4 h-4 text-blue-600 rounded"
+                              style={{ display: 'none' }}
                             />
                             {expandedTheme === theme.id ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
                             <Tag className="text-blue-600" size={18} />
@@ -731,13 +758,6 @@ const CoursSupremeViewer = ({ embedded = false }) => {
                             {decisions[theme.id].map((decision) => (
                               <div key={decision.id} className="py-3 border-b flex justify-between">
                                 <div className="flex items-center gap-3">
-                                  <input
-                                    type="checkbox"
-                                    checked={selectedDecisions.has(decision.id)}
-                                    onChange={(e) => toggleDecisionSelection(decision.id, e)}
-                                    onClick={(e) => e.stopPropagation()}
-                                    className="w-4 h-4 text-blue-600 rounded"
-                                  />
                                   <span className="font-bold text-blue-600">{decision.decision_number}</span>
                                   <span className="text-sm text-gray-500">{decision.decision_date}</span>
                                 </div>
@@ -858,20 +878,23 @@ const CoursSupremeViewer = ({ embedded = false }) => {
               <div className="flex-1 overflow-y-auto p-8 bg-gray-50">
                 {metadataLang === 'ar' ? (
                   <div className="space-y-6" dir="rtl">
-                    {selectedMetadata.title_ar ? (
+                    {(selectedMetadata.title_ar || selectedMetadata.summary_ar) ? (
                       <>
-                        <div className="bg-white rounded-lg p-6 border-l-4 border-orange-500">
-                          <h3 className="font-bold text-orange-700 mb-2">العنوان</h3>
-                          <p className="text-gray-800">{selectedMetadata.title_ar}</p>
-                        </div>
+                        {selectedMetadata.title_ar && (
+                          <div className="bg-white rounded-lg p-6 border-l-4 border-orange-500">
+                            <h3 className="font-bold text-orange-700 mb-2">العنوان</h3>
+                            <p className="text-gray-800">{selectedMetadata.title_ar}</p>
+                          </div>
+                        )}
                         {selectedMetadata.summary_ar && (
                           <div className="bg-white rounded-lg p-6 border-l-4 border-blue-500">
                             <h3 className="font-bold text-blue-700 mb-2">الملخص</h3>
                             <p className="text-gray-800">{selectedMetadata.summary_ar}</p>
                           </div>
                         )}
-                        {selectedMetadata.entities_ar && (() => {
-                          const entities = JSON.parse(selectedMetadata.entities_ar);
+                        {(() => {
+                          const entities = parseEntities(selectedMetadata.entities_ar);
+                          if (entities.length === 0) return null;
                           const grouped = entities.reduce((acc, e) => {
                             const type = e.type || 'other';
                             if (!acc[type]) acc[type] = [];
@@ -915,20 +938,23 @@ const CoursSupremeViewer = ({ embedded = false }) => {
                   </div>
                 ) : (
                   <div className="space-y-6">
-                    {selectedMetadata.title_fr ? (
+                    {(selectedMetadata.title_fr || selectedMetadata.summary_fr) ? (
                       <>
-                        <div className="bg-white rounded-lg p-6 border-l-4 border-orange-500">
-                          <h3 className="font-bold text-orange-700 mb-2">Titre</h3>
-                          <p className="text-gray-800">{selectedMetadata.title_fr}</p>
-                        </div>
+                        {selectedMetadata.title_fr && (
+                          <div className="bg-white rounded-lg p-6 border-l-4 border-orange-500">
+                            <h3 className="font-bold text-orange-700 mb-2">Titre</h3>
+                            <p className="text-gray-800">{selectedMetadata.title_fr}</p>
+                          </div>
+                        )}
                         {selectedMetadata.summary_fr && (
                           <div className="bg-white rounded-lg p-6 border-l-4 border-blue-500">
                             <h3 className="font-bold text-blue-700 mb-2">Résumé</h3>
                             <p className="text-gray-800">{selectedMetadata.summary_fr}</p>
                           </div>
                         )}
-                        {selectedMetadata.entities_fr && (() => {
-                          const entities = JSON.parse(selectedMetadata.entities_fr);
+                        {(() => {
+                          const entities = parseEntities(selectedMetadata.entities_fr);
+                          if (entities.length === 0) return null;
                           const grouped = entities.reduce((acc, e) => {
                             const type = e.type || 'other';
                             if (!acc[type]) acc[type] = [];
