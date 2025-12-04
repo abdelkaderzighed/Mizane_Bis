@@ -178,6 +178,57 @@ def _normalize_keywords(value) -> list[str] | None:
     return None
 
 
+def _extract_date_from_entities(entities, url: str | None) -> date | None:
+    """
+    Extrait la première date depuis les entités nommées et valide la cohérence avec l'URL.
+    Format attendu des entités: ["DATE - 21 Août 1962", "PERSON - Nom", ...]
+    """
+    import re
+    from dateutil import parser as date_parser
+
+    if not entities or not isinstance(entities, list):
+        return None
+
+    # Extraire l'année depuis l'URL pour validation
+    url_year = None
+    if url:
+        match = re.search(r'/F(\d{4})\d{3}\.pdf$', url)
+        if match:
+            url_year = int(match.group(1))
+
+    # Chercher la première DATE dans les entités
+    for entity in entities:
+        if not isinstance(entity, str):
+            continue
+
+        # Format: "DATE - 21 Août 1962" ou "DATE - YYYY-MM-DD"
+        if entity.upper().startswith('DATE'):
+            # Extraire la partie après "DATE -"
+            parts = entity.split('-', 1)
+            if len(parts) < 2:
+                continue
+
+            date_str = parts[1].strip()
+
+            try:
+                # Essayer de parser la date (gère "21 Août 1962", "1962-08-21", etc.)
+                parsed_date = date_parser.parse(date_str, dayfirst=True)
+
+                # Valider la cohérence avec l'année de l'URL
+                if url_year and abs(parsed_date.year - url_year) > 1:
+                    # Tolérance de 1 an pour tenir compte des décalages possibles
+                    print(f"⚠️  Date extraite {parsed_date.date()} incohérente avec URL année {url_year}, ignorée")
+                    continue
+
+                return parsed_date.date()
+
+            except (ValueError, OverflowError) as e:
+                print(f"⚠️  Impossible de parser la date '{date_str}': {e}")
+                continue
+
+    return None
+
+
 def _upsert_ai_metadata(cur, document_id: int, payload: dict) -> None:
     keywords = payload.get('keywords')
     entities = payload.get('entities')
@@ -1814,9 +1865,16 @@ Document :
                 language = (analysis_json.get('language') or 'fr').split('-')[0]
                 keywords = _normalize_keywords(analysis_json.get('keywords'))
                 entities = analysis_json.get('entities')
-                publication_date = doc.get('publication_date') or _parse_date_string(
-                    analysis_json.get('draft_date'),
-                )
+
+                # Extraire la date depuis les entités nommées (prioritaire)
+                extracted_date = _extract_date_from_entities(entities, doc.get('url'))
+                if extracted_date:
+                    publication_date = extracted_date
+                else:
+                    # Fallback sur draft_date ou date existante
+                    publication_date = doc.get('publication_date') or _parse_date_string(
+                        analysis_json.get('draft_date'),
+                    )
                 extra_metadata = {'analysis': analysis_json}
                 if embedding_data:
                     extra_metadata['embedding'] = embedding_data
@@ -1841,6 +1899,7 @@ Document :
                     UPDATE joradp_documents
                     SET ai_analysis_status = 'success',
                         analyzed_at = timezone('utc', now()),
+                        publication_date = COALESCE(%s, publication_date),
                         embedding_status = CASE
                             WHEN %s IS NOT NULL THEN %s
                             ELSE embedding_status
@@ -1855,6 +1914,7 @@ Document :
                     WHERE id = %s
                     """,
                     (
+                        publication_date,
                         embedding_status_value,
                         embedding_status_value,
                         embedding_status_value,
