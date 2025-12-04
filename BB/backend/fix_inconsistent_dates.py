@@ -3,6 +3,7 @@ Script pour corriger les dates de publication incohérentes.
 Relance l'analyse IA sur les documents où l'année de l'URL ≠ année de publication_date.
 """
 import sys
+import argparse
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -90,6 +91,10 @@ def reanalyze_documents(doc_ids, batch_size=50):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Corriger les dates de publication incohérentes')
+    parser.add_argument('--yes', '-y', action='store_true', help='Confirmer automatiquement sans prompt')
+    args = parser.parse_args()
+
     print("=" * 80)
     print("🔍 Recherche des documents avec dates incohérentes...")
     print("=" * 80)
@@ -102,12 +107,14 @@ if __name__ == '__main__':
 
     print(f"\n⚠️  Trouvé {len(inconsistent_ids)} documents avec dates incohérentes")
 
-    # Demander confirmation
-    response = input(f"\nVoulez-vous relancer l'analyse sur ces {len(inconsistent_ids)} documents ? (oui/non): ")
-
-    if response.lower() not in ['oui', 'o', 'yes', 'y']:
-        print("❌ Opération annulée")
-        sys.exit(0)
+    # Demander confirmation si --yes n'est pas fourni
+    if not args.yes:
+        response = input(f"\nVoulez-vous relancer l'analyse sur ces {len(inconsistent_ids)} documents ? (oui/non): ")
+        if response.lower() not in ['oui', 'o', 'yes', 'y']:
+            print("❌ Opération annulée")
+            sys.exit(0)
+    else:
+        print(f"\n✅ Mode automatique activé, lancement de la correction...")
 
     reanalyze_documents(inconsistent_ids)
 

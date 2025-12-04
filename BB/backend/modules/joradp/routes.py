@@ -210,6 +210,29 @@ def _extract_date_from_entities(entities, url: str | None) -> date | None:
 
             date_str = parts[1].strip()
 
+            # Normaliser les noms de mois français (gérer maj/min)
+            french_months = {
+                'janvier': 'January', 'février': 'February', 'fevrier': 'February',
+                'mars': 'March', 'avril': 'April', 'mai': 'May', 'juin': 'June',
+                'juillet': 'July', 'août': 'August', 'aout': 'August',
+                'septembre': 'September', 'octobre': 'October', 'novembre': 'November',
+                'décembre': 'December', 'decembre': 'December'
+            }
+
+            # Gérer les plages de dates (ex: "27-31 Juillet 1962")
+            # Pattern: "DD-DD Mois Année" ou "DD Mois - DD Mois Année"
+            range_match = re.match(r'^(\d{1,2})\s*-\s*(\d{1,2})\s+(\w+)\s+(\d{4})$', date_str)
+            if range_match:
+                # Prendre la date de fin de la plage
+                day_end = range_match.group(2)
+                month = range_match.group(3)
+                year = range_match.group(4)
+                date_str = f"{day_end} {month} {year}"
+
+            # Remplacer les mois français par leurs équivalents anglais
+            for fr_month, en_month in french_months.items():
+                date_str = re.sub(rf'\b{fr_month}\b', en_month, date_str, flags=re.IGNORECASE)
+
             try:
                 # Essayer de parser la date (gère "21 Août 1962", "1962-08-21", etc.)
                 parsed_date = date_parser.parse(date_str, dayfirst=True)
