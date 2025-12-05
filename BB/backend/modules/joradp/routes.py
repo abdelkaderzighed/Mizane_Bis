@@ -652,6 +652,52 @@ def get_document_metadata(doc_id):
         return jsonify({'error': str(e)}), 500
 
 
+@joradp_bp.route('/documents/<int:doc_id>/publication-date', methods=['PATCH'])
+def update_publication_date(doc_id):
+    """Mettre à jour manuellement la date de publication d'un document."""
+    try:
+        data = request.json or {}
+        new_date_str = data.get('publication_date')
+
+        if not new_date_str:
+            return jsonify({'error': 'publication_date requis'}), 400
+
+        # Parser la date (format YYYY-MM-DD attendu)
+        try:
+            from datetime import datetime
+            new_date = datetime.strptime(new_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return jsonify({'error': 'Format de date invalide. Utilisez YYYY-MM-DD'}), 400
+
+        # Mettre à jour dans la base de données
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                # Vérifier que le document existe
+                cur.execute("SELECT id FROM joradp_documents WHERE id = %s", (doc_id,))
+                if not cur.fetchone():
+                    return jsonify({'error': 'Document non trouvé'}), 404
+
+                # Mettre à jour la date
+                cur.execute(
+                    """
+                    UPDATE joradp_documents
+                    SET publication_date = %s
+                    WHERE id = %s
+                    """,
+                    (new_date, doc_id)
+                )
+                conn.commit()
+
+        return jsonify({
+            'success': True,
+            'message': 'Date de publication mise à jour',
+            'document_id': doc_id,
+            'publication_date': new_date_str
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @joradp_bp.route('/documents/<int:doc_id>/download', methods=['POST'])
 def download_single_document(doc_id):
     """Télécharger un seul document PDF"""
@@ -954,8 +1000,10 @@ def get_session_documents(session_id):
                     d.downloaded_at,
                     d.text_extracted_at,
                     d.analyzed_at,
-                    d.embedded_at
+                    d.embedded_at,
+                    CASE WHEN dam.id IS NOT NULL THEN TRUE ELSE FALSE END as has_ai_metadata
                 FROM joradp_documents d
+                LEFT JOIN document_ai_metadata dam ON dam.document_id = d.id AND dam.corpus = 'joradp'
                 WHERE {where_sql}
                 ORDER BY COALESCE(d.publication_date, d.created_at) DESC, d.id DESC
                 LIMIT %s OFFSET %s
@@ -983,6 +1031,7 @@ def get_session_documents(session_id):
 
             file_exists = bool(row['file_path_r2'])
             text_exists = bool(row['text_path_r2'])
+            ai_metadata_exists = row.get('has_ai_metadata', False)
             documents.append(
                 {
                     'id': row['id'],
@@ -1004,7 +1053,7 @@ def get_session_documents(session_id):
                         'collected': normalize_status(row['metadata_collection_status']),
                         'downloaded': reconcile_status_with_existence(row['download_status'], file_exists),
                         'text_extracted': reconcile_status_with_existence(row['text_extraction_status'], text_exists),
-                        'analyzed': normalize_status(row['ai_analysis_status']),
+                        'analyzed': reconcile_status_with_existence(row['ai_analysis_status'], ai_metadata_exists),
                         'embedded': normalize_status(row['embedding_status']),
                     },
                 }
@@ -1402,7 +1451,8 @@ def semantic_search():
         limit = int(request.args.get('limit', 0))
     except ValueError:
         limit = 0
-    score_threshold = float(request.args.get('score_threshold', 0) or 0)
+    # Par défaut, inclure tous les scores (même négatifs)
+    score_threshold = float(request.args.get('score_threshold', -1.0) or -1.0)
 
     cache = _load_embeddings_cache()
     if not cache:

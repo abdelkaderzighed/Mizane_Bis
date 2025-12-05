@@ -419,8 +419,8 @@ const HierarchicalView = () => {
       if (hasSemantic) {
         const params = new URLSearchParams({
           q: f.searchSemantique.trim(),
-          limit: '0',
-          score_threshold: '0'
+          limit: '0'
+          // score_threshold supprimé pour inclure tous les résultats (même scores négatifs)
         });
         const res = await fetch(`${JORADP_API_URL}/search/semantic?${params.toString()}`);
         const data = await res.json();
@@ -1144,10 +1144,7 @@ const HierarchicalView = () => {
                                         </td>
                                         <td className="p-2 text-center">
                                           <button onClick={() => downloadDocument(doc)} className="text-blue-600 hover:text-blue-800 mr-1" title="Télécharger le PDF">↓</button>
-                                          {/* DEBUG */}
-                                          <span style={{display: 'none'}}>{console.log('DOC COMPLET:', JSON.stringify(doc, null, 2))}</span>
-                                          <span style={{display: 'none'}}>{console.log('Champs disponibles:', Object.keys(doc))}</span>
-                                          <DocumentViewerButtons 
+                                          <DocumentViewerButtons
                                             document={{
                                               ...doc,
                                               file_path: doc.file_path,

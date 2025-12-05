@@ -1,9 +1,11 @@
 from __future__ import annotations
 from flask import Blueprint, jsonify, request, send_file, Response
-import sqlite3
 import sys
 import re
 from pathlib import Path
+# Migration SQLite → PostgreSQL
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+from shared.postgres import get_connection_simple
 import requests
 import unicodedata
 from datetime import datetime
@@ -162,7 +164,7 @@ def extract_french_tokens(value: str) -> list:
     return TOKEN_PATTERN.findall(normalized)
 
 
-def ensure_french_index(conn: sqlite3.Connection) -> None:
+def ensure_french_index(conn) -> None:
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {FRENCH_INDEX_TABLE} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,7 +176,7 @@ def ensure_french_index(conn: sqlite3.Connection) -> None:
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{FRENCH_INDEX_TABLE}_decision ON {FRENCH_INDEX_TABLE}(decision_id)")
 
 
-def rebuild_french_index_entries(conn: sqlite3.Connection) -> int:
+def rebuild_french_index_entries(conn) -> int:
     ensure_french_index(conn)
     cursor = conn.cursor()
     cursor.execute(f"DELETE FROM {FRENCH_INDEX_TABLE}")
@@ -207,13 +209,13 @@ def tokenize_query_param(value: str) -> list:
     return [token for token in tokens if token]
 
 
-def get_decision_ids_for_token(cursor: sqlite3.Cursor, token: str) -> set:
-    cursor.execute(f"SELECT decision_id FROM {FRENCH_INDEX_TABLE} WHERE token = ?", (token,))
+def get_decision_ids_for_token(cursor, token: str) -> set:
+    cursor.execute(f"SELECT decision_id FROM {FRENCH_INDEX_TABLE} WHERE token = %s", (token,))
     return {row[0] for row in cursor.fetchall()}
 
 
 def get_decision_ids_for_classification(
-    cursor: sqlite3.Cursor,
+    cursor,
     column: str,
     ids: list[int],
     require_all: bool = False,
@@ -364,7 +366,6 @@ def cosine_similarity(query_vec, target_vec):
     return numerator / denominator
 
 coursupreme_bp = Blueprint('coursupreme', __name__)
-DB_PATH = 'harvester.db'
 
 HARVESTERS_DIR = Path(__file__).resolve().parents[2] / 'harvesters'
 if str(HARVESTERS_DIR) not in sys.path:
@@ -482,8 +483,11 @@ def collect_decisions():
         data = request.get_json() or {}
         chamber_id = data.get('chamber_id')
 
-        db_path = Path(DB_PATH).resolve()
-        harvester = HarvesterCourSupremeV4Intelligent(db_path=str(db_path))
+        # TODO: Migrer les harvesters vers PostgreSQL
+        return jsonify({'error': 'Fonction de harvesting temporairement désactivée (migration PostgreSQL en cours)'}), 501
+
+        # db_path = Path(DB_PATH).resolve()
+        # harvester = HarvesterCourSupremeV4Intelligent(db_path=str(db_path))
 
         if chamber_id:
             result = harvester.harvest_section(chamber_id)
@@ -699,13 +703,12 @@ def search():
     from flask import request
     query = request.args.get('q', '')
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = get_connection_simple()
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, decision_number, decision_date, object_ar
             FROM supreme_court_decisions
-            WHERE decision_number LIKE ? OR decision_date LIKE ? OR object_ar LIKE ?
+            WHERE decision_number LIKE %s OR decision_date LIKE %s OR object_ar LIKE %s
             LIMIT 50
         """, (f'%{query}%', f'%{query}%', f'%{query}%'))
         results = [dict(row) for row in cursor.fetchall()]
@@ -717,12 +720,11 @@ def search():
 @coursupreme_bp.route('/decisions/<int:decision_id>', methods=['DELETE'])
 def delete_decision(decision_id):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         # Récupérer les chemins des fichiers AVANT suppression
-        cursor.execute("SELECT file_path_ar, file_path_fr FROM supreme_court_decisions WHERE id = ?", (decision_id,))
+        cursor.execute("SELECT file_path_ar, file_path_fr FROM supreme_court_decisions WHERE id = %s", (decision_id,))
         row = cursor.fetchone()
         
         if not row:
@@ -733,7 +735,7 @@ def delete_decision(decision_id):
         file_fr = row['file_path_fr']
         
         # Supprimer de la BD
-        cursor.execute("DELETE FROM supreme_court_decisions WHERE id = ?", (decision_id,))
+        cursor.execute("DELETE FROM supreme_court_decisions WHERE id = %s", (decision_id,))
         conn.commit()
         conn.close()
         
@@ -890,8 +892,7 @@ def batch_status():
         if not decision_ids:
             return jsonify({'error': 'Aucune décision spécifiée'}), 400
         
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         placeholders = ','.join('?' * len(decision_ids))
@@ -929,7 +930,7 @@ def batch_download():
         if not decision_ids:
             return jsonify({'error': 'Aucune décision spécifiée'}), 400
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         # Récupérer les décisions avec leur statut
@@ -964,12 +965,14 @@ def batch_download():
             })
         
         # Télécharger
-        harvester = HarvesterCourSupreme(DB_PATH)
-        results = {
-            'success': [],
-            'failed': [],
-            'skipped': already_downloaded
-        }
+        # TODO: Migrer les harvesters vers PostgreSQL
+        return jsonify({'error': 'Fonction de téléchargement temporairement désactivée (migration PostgreSQL en cours)'}), 501
+        # harvester = HarvesterCourSupreme(DB_PATH)
+        # results = {
+        #     'success': [],
+        #     'failed': [],
+        #     'skipped': already_downloaded
+        # }
         
         for dec in to_download:
             try:
@@ -979,10 +982,10 @@ def batch_download():
                 if content_dict and 'html_content_ar' in content_dict:
                     cursor.execute("""
                         UPDATE supreme_court_decisions
-                        SET html_content_ar = ?,
+                        SET html_content_ar = %s,
                             download_status = 'downloaded',
                             updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
+                        WHERE id = %s
                     """, (content_dict['html_content_ar'], dec['id']))
                     
                     results['success'].append(dec['number'])
@@ -1033,7 +1036,7 @@ def batch_translate():
         
         client = OpenAI(api_key=api_key)
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         # Récupérer les décisions
@@ -1130,9 +1133,9 @@ def batch_translate():
                 # Sauvegarder
                 cursor.execute("""
                     UPDATE supreme_court_decisions
-                    SET html_content_fr = ?,
+                    SET html_content_fr = %s,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = %s
                 """, (html_fr, dec['id']))
                 
                 results['success'].append(dec['number'])
@@ -1180,7 +1183,7 @@ def batch_analyze():
         
         client = OpenAI(api_key=api_key)
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         # Récupérer les décisions
@@ -1332,7 +1335,7 @@ Réponds UNIQUEMENT avec le JSON, sans texte avant ou après."""}
                 # Sauvegarder
                 cursor.execute("""
                     UPDATE supreme_court_decisions
-                    SET decision_date = COALESCE(?, decision_date),
+                    SET decision_date = COALESCE(%s, decision_date),
                         summary_ar = ?,
                         summary_fr = ?,
                         title_ar = ?,
@@ -1397,7 +1400,7 @@ def batch_embed():
         print("🧬 Chargement du modèle d'embedding...")
         embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         # Récupérer les décisions
@@ -1509,10 +1512,10 @@ def batch_embed():
                 # Sauvegarder
                 cursor.execute("""
                     UPDATE supreme_court_decisions
-                    SET embedding_fr = ?,
-                        embedding_ar = ?,
+                    SET embedding_fr = %s,
+                        embedding_ar = %s,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = %s
                 """, (embedding_bytes_fr, embedding_bytes_ar, dec['id']))
                 
                 results['success'].append(dec['number'])
@@ -1544,7 +1547,7 @@ def batch_embed():
 def get_chamber_all_decision_ids(chamber_id):
     """Récupérer tous les IDs des décisions d'une chambre (pour sélection en cascade)"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         # Récupérer tous les IDs des décisions de cette chambre
@@ -1552,7 +1555,7 @@ def get_chamber_all_decision_ids(chamber_id):
             SELECT DISTINCT d.id
             FROM supreme_court_decisions d
             JOIN supreme_court_decision_classifications dc ON d.id = dc.decision_id
-            WHERE dc.chamber_id = ?
+            WHERE dc.chamber_id = %s
             ORDER BY d.id
         """, (chamber_id,))
         
@@ -1571,7 +1574,7 @@ def get_chamber_all_decision_ids(chamber_id):
 def get_theme_all_decision_ids(theme_id):
     """Récupérer tous les IDs des décisions d'un thème (pour sélection en cascade)"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         # Récupérer tous les IDs des décisions de ce thème
@@ -1579,7 +1582,7 @@ def get_theme_all_decision_ids(theme_id):
             SELECT DISTINCT d.id
             FROM supreme_court_decisions d
             JOIN supreme_court_decision_classifications dc ON d.id = dc.decision_id
-            WHERE dc.theme_id = ?
+            WHERE dc.theme_id = %s
             ORDER BY d.id
         """, (theme_id,))
         
@@ -1598,7 +1601,7 @@ def get_theme_all_decision_ids(theme_id):
 def get_all_decision_ids():
     """Récupérer tous les IDs de toutes les décisions (pour 'Tout sélectionner')"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         cursor.execute("SELECT id FROM supreme_court_decisions ORDER BY id")
@@ -1617,14 +1620,14 @@ def get_all_decision_ids():
 def get_chamber_all_ids(chamber_id):
     """Récupérer tous les IDs (thèmes + décisions) d'une chambre"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         cursor = conn.cursor()
         
         # Récupérer les IDs des thèmes
         cursor.execute("""
             SELECT DISTINCT theme_id
             FROM supreme_court_decision_classifications
-            WHERE chamber_id = ?
+            WHERE chamber_id = %s
         """, (chamber_id,))
         theme_ids = [row[0] for row in cursor.fetchall()]
         
@@ -1632,7 +1635,7 @@ def get_chamber_all_ids(chamber_id):
         cursor.execute("""
             SELECT DISTINCT decision_id
             FROM supreme_court_decision_classifications
-            WHERE chamber_id = ?
+            WHERE chamber_id = %s
         """, (chamber_id,))
         decision_ids = [row[0] for row in cursor.fetchall()]
         
@@ -1676,7 +1679,7 @@ def get_all_themes():
 def rebuild_french_index():
     """Regénérer l’index inversé français."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection_simple()
         inserted = rebuild_french_index_entries(conn)
         conn.close()
         return jsonify({'inserted': inserted})
@@ -1936,10 +1939,9 @@ def download_single_decision(decision_id):
 
     try:
         # Récupérer la décision
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = get_connection_simple()
         cursor = conn.cursor()
-        cursor.execute('SELECT id, url, download_status FROM supreme_court_decisions WHERE id = ?', (decision_id,))
+        cursor.execute('SELECT id, url, download_status FROM supreme_court_decisions WHERE id = %s', (decision_id,))
         decision = cursor.fetchone()
         conn.close()
 
@@ -2006,8 +2008,7 @@ def export_decisions():
     if not numeric_ids:
         return jsonify({'error': 'decision_ids requis'}), 400
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_connection_simple()
     cursor = conn.cursor()
     placeholders = ','.join('?' * len(numeric_ids))
     cursor.execute(

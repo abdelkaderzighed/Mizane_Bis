@@ -571,30 +571,59 @@ export default function LibraryPage() {
       </div>
 
       <Dialog open={Boolean(metadataDoc)} onOpenChange={(open) => !open && handleCloseMetadata()}>
-        <DialogContent>
+        <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Métadonnées</DialogTitle>
-            <DialogDescription>Les informations extraites lors de l’analyse IA.</DialogDescription>
+            <DialogTitle>📄 Métadonnées du Document</DialogTitle>
+            <DialogDescription>Informations complètes et analyse IA.</DialogDescription>
           </DialogHeader>
-          <div className="flex items-center gap-2 mb-3">
-            <Button
-              variant={metadataTab === 'fr' ? 'default' : 'outline'}
-              size="sm"
-              onClick={() => setMetadataTab('fr')}
-            >
-              Français
-            </Button>
-            <Button
-              variant={metadataTab === 'ar' ? 'default' : 'outline'}
-              size="sm"
-              onClick={() => setMetadataTab('ar')}
-            >
-              العربية
-            </Button>
+
+          {/* Informations générales */}
+          {metadataDoc && (
+            <div className="mb-4 p-4 bg-slate-50 rounded-lg">
+              <h4 className="font-semibold mb-3 text-sm">Informations générales</h4>
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div><span className="font-medium">Numéro :</span> {metadataDoc.id}</div>
+                <div><span className="font-medium">Date :</span> {metadataDoc.publication_date ? new Date(metadataDoc.publication_date).toLocaleDateString('fr-FR') : '—'}</div>
+                {metadataDoc.file_size && (
+                  <div><span className="font-medium">Taille :</span> {(metadataDoc.file_size / 1024).toFixed(1)} KB</div>
+                )}
+                <div><span className="font-medium">ID :</span> {metadataDoc.id}</div>
+              </div>
+              {metadataDoc.url && (
+                <div className="mt-3 text-sm">
+                  <span className="font-medium">URL :</span>{' '}
+                  <a href={metadataDoc.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                    {metadataDoc.url}
+                  </a>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Analyse IA */}
+          <div className="mb-4 p-4 bg-purple-50 rounded-lg">
+            <h4 className="font-semibold mb-3 text-sm">🤖 Analyse IA</h4>
+            <div className="flex items-center gap-2 mb-3">
+              <Button
+                variant={metadataTab === 'fr' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setMetadataTab('fr')}
+              >
+                Français
+              </Button>
+              <Button
+                variant={metadataTab === 'ar' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setMetadataTab('ar')}
+              >
+                العربية
+              </Button>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white p-4 text-sm leading-relaxed text-slate-800">
+              {metadataTab === 'fr' ? renderMetadataContent('fr') : renderMetadataContent('ar')}
+            </div>
           </div>
-          <div className="max-h-[360px] overflow-auto rounded-xl border border-slate-200 bg-white p-4 text-sm leading-relaxed text-slate-800 space-y-3">
-            {metadataTab === 'fr' ? renderMetadataContent('fr') : renderMetadataContent('ar')}
-          </div>
+
           <DialogFooter>
             <Button variant="outline" onClick={handleCloseMetadata}>
               Fermer
